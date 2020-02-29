@@ -1,0 +1,1011 @@
+# !diagnostics off
+
+#####################
+# ~ Run The daily scrapes ~ #
+#####################
+
+source('H:/NBA/Scripts/SEASON_RESULTS_SCRAPE_12082019.R')
+source('H:/NBA/Scripts/CTG_SCRAPE_12072019.R')
+rm(list=ls())
+
+#####################
+# ~ Run Source packages ~ #
+#####################
+
+#Run the functions for scripts
+source('H:/NBA/Scripts/Package_Import.R')
+source('H:/NBA/Scripts/Statistical_Functions.R')
+source('H:/NBA/Scripts/Model_Functions.R')
+
+#####################
+# ~ Import tables ~ #
+#####################
+
+#Index of table names in mongo to environment names in R
+index <-
+  data.frame(
+    MONGODB_NAME = c('CTG_TEAM', 'CTG_PLAYER', 'CTG_GENERAL_NAME_CONVERT', 'CTG_TEAM_TABLE_NAME_CONVERT', 'CTG_PLAYER_TABLE_NAME_CONVERT', 
+                     'BETTING_TABLE_TEAM_CONVERT', 'BETTING_TABLE', 'STADIUM_COORDINATES', 'API_NAME_TABLE', 'NBA_SCHEDULE'),
+    ENV_NAME = c('team_data', 'player_data', 'ctg_name_convert', 'ctg_team_defunct_names', 'ctg_player_defunct_names',
+                 'betting_table_names', 'lines', 'stadium_coords', 'api_name_table', 'schedule'),
+    stringsAsFactors = FALSE
+  )
+
+#Credentials
+username <- 'thatsmrlongcut'
+password <- 'football17'
+
+#Run a loop and import/assign
+for(i in 1:nrow(index)) {
+  #Establish connection with mongo db
+  con <-
+    mongo(
+      collection = "NFL",
+      db = index$MONGODB_NAME[i],
+      url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+    )
+  #Assign object
+  assign(index$ENV_NAME[i], con$find(), envir = .GlobalEnv)
+  rm(con)
+}
+
+#####################
+# ~ Read in the Schedule ~ #
+#####################
+
+#Melt into one long format -- team opponent, etc
+ha_ids <- c("Home_Team", "Away_Team")
+
+schedule <- 
+  do.call("rbind", lapply(1:length(ha_ids), function(x) {
+    schedule %>%
+      mutate(Date = as.Date(Date)) %>%
+      dplyr::select(one_of(c('Date', 'Home_Team', 'Away_Team'))) %>%
+      mutate(Home_Away = gsub("_Team", "", ha_ids[x])) %>%
+      setNames(gsub(ha_ids[-x], "Opponent", names(.))) %>%
+      setNames(gsub(ha_ids[x], "Team", names(.))) %>%
+      setNames(gsub(paste0(gsub("_Team", "", ha_ids[x]), '.Points'), "Points", names(.)))
+  }))
+
+#####################
+# ~ Team Data Structuring ~ #
+#####################
+
+#Define all the numeric fields in the data frame initially -- these are all we want to compare
+numeric_fields <- colnames(team_data)[which(do.call("c", lapply(team_data, is.numeric)))]
+
+#Create the trailing average sequence
+trailing_average_sequence <- c(5, 15, 25, 45, 65)
+
+#Clean up the initial team data extract
+team_spl <-
+  team_data %>%
+  mutate(
+    #Defunct name convert
+    Team = ifelse(Team %in% ctg_team_defunct_names$old_team_name, ctg_team_defunct_names$new_team_name[match(Team, ctg_team_defunct_names$old_team_name)], as.character(Team)),
+    Opponent = ifelse(Opponent %in% ctg_team_defunct_names$old_team_name, ctg_team_defunct_names$new_team_name[match(Opponent, ctg_team_defunct_names$old_team_name)], as.character(Opponent)),
+    
+    #Convert date to date/Season info
+    Date = as.Date(Date),
+    Season = ifelse(yday(Date) < 200, year(Date), year(Date)+1),
+    
+    #Add scalar
+    scalar = 1
+  ) %>%
+  
+  arrange(Date) %>%
+  
+  #Add a rolling game count in the season -- we don't want to include playoffs
+  group_by(Team, Season) %>%
+  mutate(Game_Count = cumsum(scalar)) %>%
+  as.data.frame %>%
+  filter(Game_Count <= ifelse(Season == 2012, 66, 82)) %>% #2012 was a shortened year, regular season ends after 82 games -- i dont think we have all of 2004 but idgaf
+  as.data.frame %>%
+  
+  #Get rid of the scalar/ and id
+  dplyr::select(-scalar, -id, -Game_Count) %>%
+  
+  #Arrange nearest to oldest
+  arrange(desc(Date)) %>%
+  
+  group_by(Team) %>%
+  
+  mutate(game_back_count = row_number()) %>%
+  as.data.frame %>%
+  filter(game_back_count <= max(trailing_average_sequence)*2) %>%
+  as.data.frame %>%
+  arrange(Date)
+
+#Create a data frame to combine with
+team_spl <- plyr::rbind.fill(team_spl, 
+                             schedule %>%
+                               filter(Date == as.Date(now()))
+                             )
+                             
+#You will need to speed this up -- assign multiple cores to do this task
+cl <- makeCluster(detectCores(), type = "SOCK")
+
+#Export the required objects to the other clusters
+clusterExport(cl, list(
+  "team_spl", "numeric_fields", "trailing_average_sequence"
+))
+
+#Cluster apply the trailing average composition
+trailing_avg_bin <-
+  clusterApply(cl, 1:length(trailing_average_sequence), function(z) {
+    source('H:/NBA/Scripts/Package_Import.R')
+    source('H:/NBA/Scripts/Statistical_Functions.R')
+    team_spl %>% trail_stat_combine(., numeric_fields, trailing_average_sequence[z])
+  })
+
+#Stop the cluster
+stopCluster(cl)
+
+na.locf2 <- function(x) na.locf(x, na.rm = FALSE)
+
+#Fix the NAs (probably should have caught this in the initial build....)
+trailing_avg_bin <-
+  lapply(1:length(trailing_avg_bin), function(i) {
+    idf <- trailing_avg_bin[[i]]
+    for(x in 1:ncol(idf)) {
+      if(class(idf[,x]) == "numeric") {
+        idf[which(!is.finite(idf[,x])),x] <- NA
+      }
+    }
+    idf %>%
+      group_by(Team) %>%
+      arrange(Date) %>%
+      do(na.locf2(.)) %>% 
+      ungroup %>%
+      as.data.frame
+  })
+
+#Perform the base difference calculations
+trailing_avg_bin <- base_dif_calc(trailing_avg_bin, trailing_average_sequence)
+
+#Define the variables you want scaled to the rest of the league
+vars_to_scale <- 
+  trailing_avg_bin %>%
+  dplyr::select(-Team, -Date) %>%
+  names(.)
+
+#You will need to speed this up -- assign multiple cores to do this task
+cl <- makeCluster(detectCores(), type = "SOCK")
+
+#Export the required objects to the other clusters
+clusterExport(cl, list(
+  "trailing_avg_bin", "vars_to_scale"
+))
+
+#Cluster apply scale those fuckers
+trailing_avg_bin <-
+  Reduce(merge, 
+         clusterApply(cl, 1:length(vars_to_scale), function(z) {
+           source('H:/NBA/Scripts/Package_Import.R')
+           source('H:/NBA/Scripts/Statistical_Functions.R')
+           scale_var(trailing_avg_bin, vars_to_scale[z])
+         }))
+
+#Stop the cluster
+stopCluster(cl)
+
+#################################
+# ~ Compute Streaks the Team is on ~ #
+#################################
+
+#Find the vars to compute streaks
+streak_vars <-
+  do.call("c", plyr::compact(lapply(1:ncol(team_data), function(i) {
+    if(paste0(colnames(team_data)[i], '_Alwd') %in% colnames(team_data)) {
+      colnames(team_data)[i]
+    }
+  })))
+
+#Compute the streaks
+streaks <- 
+  streak_function(team_data %>% mutate(Date = as.Date(paste(Date))), streak_vars) %>%
+  split(., .$Team) %>%
+  map(~df_na.locf(.)) %>%
+  invoke(rbind, .) %>%
+  group_by(Team) %>%
+  arrange(Date) %>%
+  summarise_all(last) %>%
+  as.data.frame %>%
+  dplyr::select(-Date)
+
+#################################
+# ~ Compute Player Info ~ #
+#################################
+
+#Just note this is an unbelievably poor attempt at giving even a shred of a fucking shit about making player data super useful
+#It would take a long time and a lot of research to attempt to make something that has marginal improvement than this on the end model
+#So fuckkkk it
+
+#Read in the player data and compute starter/sitter averages
+player_data <-
+  player_data %>%
+  #Fix team names
+  mutate(Team = ifelse(Team %in% ctg_name_convert$NAME, ctg_name_convert$CTG_TEAM[match(Team, ctg_name_convert$NAME)], 
+                       ctg_player_defunct_names$new_team_name[match(Team, ctg_player_defunct_names$old_team_name)])) %>%
+  dplyr::select(-id) %>%
+  #Get the totals for each of the bins
+  group_by(Team, Date) %>%
+  mutate_at(c('PTS', 'REB', 'AST', 'FGM', 'FGA', 'FGM_3P', 'FGA_3P', 'FTM', 'FTA'), list(TOT = ~sum(., na.rm = T))) %>%
+  as.data.frame %>%
+  pct_team_tot("_TOT") %>%
+  split(.$Player) %>%
+  map(~cum_avg_stats(.)) %>%
+  invoke(rbind, .) %>%
+  group_by(Date, Team, STARTER) %>%
+  mutate(MIN_PCT = TOT_MIN/sum(TOT_MIN)) %>%
+  summarise_at(c('AST_PCT', 'BLK_PCT', 'PTS', 'ASTD_PCT', 'fgDR_PCT', 'fgOR_PCT', 'MIN', 'PSA', 'STL_PCT', 'TOV_PCT', 
+                 'Usage', 'REB', 'AST', 'FGM', 'FGA', 'FGM_3P', 'FGA_3P', 'FTM', 'FTA', 'PTS_PCT_TM', 'REB_PCT_TM',
+                 'AST_PCT_TM', 'FGM_PCT_TM', 'FGA_PCT_TM', 'FGM_3P_PCT_TM', 'FGA_3P_PCT_TM', 'FTM_PCT_TM', 'FTA_PCT_TM',
+                 'TOT_GMS', 'TOT_MIN'),  ~sum(. * MIN_PCT)) %>%
+  spread_starters()
+
+#Quick filter to speed shit up
+player_data <-
+  player_data %>%
+  filter(Date >= as.Date(now())-10)
+
+#Define the variables you want scaled buddy
+vars_to_scale <- 
+  player_data %>%
+  dplyr::select(-Team, -Date) %>%
+  names(.)
+
+#You will need to speed this up -- assign multiple cores to do this task
+cl <- makeCluster(detectCores(), type="SOCK")
+
+#Export the required objects to the other clusters
+clusterExport(cl, list(
+  "player_data", "vars_to_scale"
+))
+
+#Cluster apply scale those fuckers
+player_data <-
+  Reduce(merge, 
+         clusterApply(cl, 1:length(vars_to_scale), function(z) {
+           source('H:/NBA/Scripts/Package_Import.R')
+           source('H:/NBA/Scripts/Statistical_Functions.R')
+           scale_var(player_data, vars_to_scale[z])
+         }))
+
+#Stop the cluster
+stopCluster(cl)
+
+player_data <-
+player_data %>%
+  group_by(Team) %>%
+  arrange(Date) %>%
+  summarise_all(last) %>%
+  as.data.frame %>%
+  dplyr::select(-Date)
+
+#################################
+# ~ Travel Distance ~ #
+#################################
+
+#Modify the coordinates making them a nested vector
+stadium_coords <-
+  stadium_coords %>%
+  rowwise() %>%
+  mutate(Coordinates = list(c(Longitude, Latitude)))
+
+#Create the distance traveled from last game to this game data frame
+distance_traveled_df <-
+  rbind(team_data %>%
+          mutate(Date = as.Date(Date)) %>%
+          arrange(Date) %>%
+          dplyr::select(Date, Team, Opponent, Home_Away),
+        schedule %>% filter(Date == as.Date(now()))) %>%
+  group_by(Team) %>%
+  mutate(Last_Game_Location = ifelse(shift(Home_Away) == 'Home', 
+                                     stadium_coords$Coordinates[match(shift(Team), stadium_coords$CTG_TEAM)],  
+                                     stadium_coords$Coordinates[match(shift(Opponent), stadium_coords$CTG_TEAM)]),
+         Current_Game_Location = ifelse(Home_Away == 'Home', 
+                                        stadium_coords$Coordinates[match(Team, stadium_coords$CTG_TEAM)],  
+                                        stadium_coords$Coordinates[match(Opponent, stadium_coords$CTG_TEAM)])) %>%
+  as.data.frame %>%
+  rowwise() %>%
+  mutate(le_1 = length(Current_Game_Location),
+         le_2 = length(Last_Game_Location)) %>%
+  as.data.frame %>%
+  filter(le_1 > 0 & le_2 > 0) %>%
+  rowwise() %>%
+  mutate(Valid_Coordinates = sum(is.na(unlist(Last_Game_Location))),
+         Distance_Traveled = ifelse(Valid_Coordinates != 0, NA, distm(unlist(Last_Game_Location), unlist(Current_Game_Location)))) %>%
+  as.data.frame %>%
+  dplyr::select(Date, Team, Distance_Traveled) %>%
+  #Now do bulk calculation on distance traveled per day
+  dist_per_day_bulk(., c(1, 3, 5, 10, 15, 25, 35, 50))
+
+#################################
+# ~ Combine and Pre-Process for Final Table ~ #
+#################################
+
+df <-
+team_spl %>%
+  dplyr::select(Season, Date, Team, Opponent, Home_Away) %>%
+  group_by(Team) %>%
+  arrange(Date) %>%
+  summarise_all(last) %>%
+  as.data.frame %>%
+  mutate(Season = 2020) %>%
+  left_join(trailing_avg_bin %>% 
+              split(., .$Team) %>%
+              map(~df_na.locf(.)) %>%
+              invoke(rbind, .), 
+            by = c('Date', 'Team'), suffix = c('', '_TAVG_BASE')) %>%
+  left_join(streaks, by = c('Team')) %>%
+  left_join(player_data, by = c('Team')) %>%
+  left_join(distance_traveled_df, by = c('Date', 'Team')) %>%
+  mutate(Home_Away = ifelse(Home_Away == 'Home', 1, 0)) %>%
+  mutate(Season_Days = as.numeric(difftime(Date, as.Date("2019-10-22"), unit = "days")),
+         Month = month(Date))
+
+#################################
+# ~ Define the target variables now ~ #
+#################################
+
+variables <- list(
+  TARGET = c('Spread', 'Over_Under', 'Total_Points', 'Points', 'Points_Alwd', 'Over_Under_Coverage', 'Over_Under_Differential',
+             'Point_Differential', 'Spread_Differential', 'Spread_Coverage', 'Win_Loss'),
+  ID = c('Set', 'Date', 'Team', 'Opponent', 'id'),
+  
+  COMMON = c('Home_Away', 'Season_Days', 'Month')
+)
+
+#################################
+# ~ Read in layer1 A ~ #
+#################################
+
+#List the variables
+y_vars <- variables$TARGET
+
+#Positive Classes (for classification)
+pos_classes <- c(NA, NA, NA, NA, NA, 'over', NA, NA, NA, 'covered', 'win')
+
+#Path
+path <- 'H:/NBA/Model Build/Layer 1/a/'
+
+#Set working directory
+setwd(path)
+
+layer1_a <- 
+  lapply(1:length(y_vars), function(x) {
+    if(paste0(y_vars[x], '.rds') %in% list.files()) {
+      readRDS(paste0(y_vars[x], '.rds'))
+    }
+  })
+names(layer1_a) <- y_vars
+
+layer1_a <- plyr::compact(layer1_a)
+
+#################################
+# ~ Read in layer1 B ~ #
+#################################
+
+#Path
+path <- 'H:/NBA/Model Build/Layer 1/b/'
+
+#Set working directory
+setwd(path)
+
+
+layer1_b <- 
+  lapply(1:length(y_vars), function(x) {
+    if(paste0(y_vars[x], '.rds') %in% list.files()) {
+      readRDS(paste0(y_vars[x], '.rds'))
+    }
+  })
+names(layer1_b) <- y_vars
+
+layer1_b <- plyr::compact(layer1_b)
+
+#################################
+# ~ Replicate bs variables ~
+#################################
+
+df <- cbind.data.frame(df, 
+                       lapply(1:length(y_vars), function(i) {
+                         if(is.na(pos_classes[i])) {
+                           rep(-999999, times = nrow(df))
+                         } else {
+                           rep(pos_classes[i], times = nrow(df))
+                         }
+                       }) %>%
+                         invoke(cbind.data.frame, .) %>%
+                         setNames(y_vars))
+
+#################################
+# ~ Create the nuttiness ~ #
+#################################
+
+df <- df %>% mutate(Date = max(df$Date))
+
+#Empty date data frame to merge into
+date_df <- data.frame(Date = unique(as.Date(df$Date)))
+
+#Split by team 
+by_team <- split(df, df$Team)
+
+#Merge and fill forward
+team_mat <-
+  lapply(1:length(by_team), function(x) {
+    date_df %>%
+      left_join(by_team[[x]],
+                by = 'Date') %>%
+      na.locf()
+  })
+names(team_mat) <- names(by_team)
+
+#################################
+# ~ Prepare the computer to cluster apply this beast ~ #
+#################################
+
+#You will need to speed this up -- assign multiple cores to do this task
+cl <- makeCluster(8, type = "SOCK")
+
+#Export the required objects to the other clusters
+clusterExport(cl, list(
+  "team_mat", "df", "layer1_a", "layer1_b", "y_vars", "variables", "pos_classes"
+))
+
+#For every row of the data frame perform the nuttiness
+xx <- 
+  clusterApply(cl, 1:nrow(df), function(u) {
+    tryCatch({
+      
+      #Run the functions for scripts
+      source('H:/NBA/Scripts/Package_Import.R')
+      source('H:/NBA/Scripts/Statistical_Functions.R')
+      
+      lst_oput <-
+        lapply(1:length(names(team_mat)), function(z) {
+          
+          init_df <-
+            df[u,] %>%
+            left_join(team_mat[[names(team_mat)[z]]] %>%
+                        mutate(Team = df$Team[u]) %>%
+                        dplyr::select(one_of(c('Date', 'Team', colnames(df)[!(colnames(df) %in% (do.call("c", variables) %>% as.character))]))),
+                      by = c('Date', 'Team'), suffix = c('', '_OPP')) %>%
+            compare_cols2(., '_OPP') %>%
+            na.omit()
+          
+          #################################
+          # ~ Extract all layer 1.a predictions ~ #
+          #################################
+          
+          pred_df <-
+            do.call("cbind.data.frame", 
+                    plyr::compact(lapply(1:length(y_vars), function(i) {
+                      #Declare the variable
+                      variable <- y_vars[i]
+                      
+                      if(variable %in% names(layer1_a)) {
+                        #Read in the bin of all models for that variable
+                        model_bin <- layer1_a[[variable]]
+                        
+                        
+                        idf <-
+                          do.call("cbind.data.frame", lapply(1:length(model_bin), function(x) {
+                            model <- model_bin[[x]]$Model
+                            
+                            #Grab the features
+                            features <- model$features
+                            
+                            #Grab the type
+                            type <- model$task.desc$type
+                            
+                            #Make a copy of the data
+                            df_copy <- 
+                              init_df %>%
+                              #Grab only the required features
+                              dplyr::select(one_of(c(variable, model$features)))
+                            
+                            #Rename the first column
+                            colnames(df_copy)[1] <- 'target'
+                            
+                            #If it is a classification task, identify the positive variable
+                            p_var <- pos_classes[i]
+                            
+                            #Transform into a task
+                            df_task <- if(type == 'classif') {
+                              makeClassifTask(data = df_copy,
+                                              target = 'target')
+                            } else {
+                              makeRegrTask(data = df_copy,
+                                           target = 'target')
+                            }
+                            
+                            #Make predictions from the model
+                            preds <-
+                              if(type == 'regr') {
+                                predict(model, df_task)$data$response } else {
+                                  predict(model, df_task)$data[, paste0('prob.', p_var)]
+                                }
+                            
+                            #Make into a data frame
+                            preds <- data.frame(preds)
+                            
+                            #Rename column
+                            colnames(preds) <- paste0(variable, '_', x)
+                            
+                            #Return the data
+                            preds
+                          }))
+                      }
+                      
+                    })))
+          
+          #Merge back with the variables
+          l1a <- cbind.data.frame(init_df %>%
+                                    dplyr::select(one_of(y_vars)),
+                                  pred_df)
+          
+          #################################
+          # ~ Extract all layer 1.b predictions ~ #
+          #################################
+          pred_df <-
+            do.call("cbind.data.frame", 
+                    plyr::compact(lapply(1:length(y_vars), function(i) {
+                      #Declare the variable
+                      variable <- y_vars[i]
+                      
+                      if(variable %in% names(layer1_b)) {
+                        #Read in the bin of all models for that variable
+                        model_bin <- layer1_b[[variable]]
+                        
+                        
+                        idf <-
+                          do.call("cbind.data.frame", lapply(1:1, function(x) {
+                            model <- model_bin[[x]]$Model
+                            
+                            #Grab the features
+                            features <- model$features
+                            
+                            #Grab the type
+                            type <- model$task.desc$type
+                            
+                            #Make a copy of the data
+                            df_copy <- 
+                              l1a %>%
+                              #Grab only the required features
+                              dplyr::select(one_of(c(variable, model$features)))
+                            
+                            #Rename the first column
+                            colnames(df_copy)[1] <- 'target'
+                            
+                            #If it is a classification task, identify the positive variable
+                            p_var <- pos_classes[i]
+                            
+                            #Transform into a task
+                            df_task <- if(type == 'classif') {
+                              makeClassifTask(data = df_copy,
+                                              target = 'target')
+                            } else {
+                              makeRegrTask(data = df_copy,
+                                           target = 'target')
+                            }
+                            
+                            #Make predictions from the model
+                            preds <-
+                              if(type == 'regr') {
+                                predict(model, df_task)$data$response } else {
+                                  predict(model, df_task)$data[, paste0('prob.', p_var)]
+                                }
+                            
+                            #Make into a data frame
+                            preds <- data.frame(preds)
+                            
+                            #Rename column
+                            colnames(preds) <- paste0(variable, '_', x)
+                            
+                            #Return the data
+                            preds
+                          }))
+                      }
+                      
+                    })))
+          
+          pred_df %>%
+            mutate(PROC_TEAM = names(team_mat)[z])
+        })
+      
+      print(u)
+      
+      lst_oput %>%
+        invoke(rbind, .) %>%
+        mutate(Team = df$Team[u],
+               Opponent = df$Opponent[u],
+               Date = df$Date[u],
+               Home_Away = df$Home_Away[u])
+      
+    }, error = function(e) {})
+  })
+
+stopCluster(cl)
+
+
+xx <-
+  plyr::compact(xx) %>%
+  invoke(rbind, .) %>%
+  mutate(Home_Away = ifelse(Home_Away == 1, 'Home', 'Away'),
+         PK = ifelse(Home_Away == 'Home', 
+                     paste(Team, Opponent, Date, sep = '_'),
+                     paste(Opponent, Team, Date, sep = '_')))
+
+#Get the actual values of the layer 1 b model outputs
+l2b <- 
+  xx %>%
+  filter(Opponent == PROC_TEAM) %>%
+  dplyr::select(-PROC_TEAM) %>%
+  home_away_wide_format(.) %>%
+  setNames(gsub("_1_", "_", names(.)))
+
+
+#Get the mean values for the layer 1 b model outputs against every other team in the league
+raw_avgs <-
+  xx %>%
+  filter(Team != PROC_TEAM) %>%
+  dplyr::select(-PROC_TEAM) %>%
+  group_by(PK, Team, Opponent, Date, Home_Away) %>%
+  summarise_all(list(AVG = mean, STDEV = sd)) %>%
+  as.data.frame %>%
+  home_away_wide_format(.) %>%
+  setNames(gsub("_1_", "_", names(.)))
+
+#Get specific values for the model outputs against every other team in the league
+spec_vals <-
+  xx %>%
+  filter(Team != PROC_TEAM) %>%
+  group_by(PK, Team, Opponent, Team, Date, Home_Away) %>%
+  summarise(WINS_PROB = sum(Win_Loss_1 > 0.5)/29,
+            WINS_CONT = sum(Point_Differential_1 > 0)/29,
+            SPREAD_COVERAGE_PROB = sum(Spread_Coverage_1 > 0.5)/29,
+            SPREAD_COVERAGE_CONT = sum(Spread_Differential_1 > 0)/29,
+            OVER_UNDER_PROB = sum(Over_Under_Coverage_1 > 0.5)/29,
+            OVER_UNDER_CONT = sum(Over_Under_Differential_1 > 0)/29) %>%
+  as.data.frame %>%
+  home_away_wide_format(.)
+
+#Grab the average differences of the two teams playing against every opponent
+avg_difs <-
+  xx %>%
+  filter(Team != PROC_TEAM) %>%
+  matrix_compare_wide_format(.)
+
+#Merge all together
+oput <-
+  l2b %>%
+  left_join(raw_avgs, by = c('Date', 'Team', 'Opponent', 'PK')) %>%
+  left_join(spec_vals, by = c('Date', 'Team', 'Opponent', 'PK')) %>%
+  left_join(avg_difs, by = c('Date', 'Team', 'Opponent', 'PK'))
+
+#################################
+# ~ bring back in the y variables ~ #
+#################################
+
+oput <-
+  oput %>%
+  dplyr::select(-PK) %>%
+  left_join(
+    df %>%
+      dplyr::select(one_of(c(variables$TARGET, variables$ID))),
+    by = c('Date', 'Team', 'Opponent')
+  ) %>%
+  na.omit()
+
+
+#################################
+# ~ Find the most used variables in Layer 1 a ~ #
+#################################
+
+keepers <- 
+  lapply(1:length(layer1_a), function(x) {
+    data.frame(VAR = do.call("c", lapply(1:length(layer1_a[[x]]), function(i) {
+      layer1_a[[x]][[i]]$Model$features
+    })))
+  }) %>%
+  invoke(rbind, .) %>%
+  group_by(VAR) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  filter(count > 31,
+         VAR %in% do.call("c", variables) == F) %>%
+  .$VAR %>%
+  as.character
+
+#Put the primary key back on the output data frame and the initial one cause im an idiot :)
+#Also clean it up so that only the dates that are in 
+df <- 
+  df %>%
+  mutate(Home_Away = ifelse(Home_Away == 1, 'Home', 'Away'),
+         PK = ifelse(Home_Away == 'Home', 
+                     paste(Team, Opponent, Date, sep = '_'),
+                     paste(Opponent, Team, Date, sep = '_')))
+
+#Grab the 'key' stats from the data frame that will be kept
+df_ha_key_stats <-
+  df %>%
+  filter(Date %in% oput$Date) %>%
+  dplyr::select(one_of(c('PK', 'Home_Away', 'Date', 'Team', 'Opponent', keepers))) %>%
+  home_away_wide_format(.)
+
+#Merge it with the output and get the final frame
+final_frame <-
+  oput %>%
+  left_join(
+    df_ha_key_stats %>%
+      dplyr::select(-PK),
+    by = c('Date', 'Team', 'Opponent')
+  ) %>%
+  mutate(id = row_number())
+
+#################################
+# ~ Predict Final Layer ~ #
+#################################
+
+#Establish the path to drop the Layer 2 a Models
+path <- 'H:/NBA/Model Build/Layer 2/a/'
+setwd(path)
+
+dfx <- final_frame
+
+#List the variables
+y_vars <- c('Spread', 'Over_Under', 'Total_Points', 'Points', 'Points_Alwd', 'Over_Under_Coverage', 'Over_Under_Differential',
+            'Point_Differential', 'Spread_Differential', 'Spread_Coverage', 'Win_Loss')
+
+#Positive Classes (for classification)
+pos_classes <- c(NA, NA, NA, NA, NA, 'over', NA, NA, NA, 'covered', 'win')
+
+
+bigboi <-
+  lapply(1:length(y_vars), function(i) {
+    variable <- y_vars[i]
+    model_bin <- readRDS(paste0(variable, '.rds'))
+    
+    idf <-
+      do.call("cbind.data.frame", lapply(1:length(model_bin), function(x) {
+        model <- model_bin[[x]]$Model
+        
+        #Grab the features
+        features <- model$features
+        
+        #Grab the type
+        type <- model$task.desc$type
+        
+        #Make a copy of the data
+        df_copy <- 
+          dfx %>%
+          #Grab only the required features
+          dplyr::select(one_of(c(variable, model$features)))
+        
+        #Rename the first column
+        colnames(df_copy)[1] <- 'target'
+        
+        #If it is a classification task, identify the positive variable
+        p_var <- pos_classes[i]
+        
+        #Transform into a task
+        df_task <- if(type == 'classif') {
+          makeClassifTask(data = df_copy,
+                          target = 'target')
+        } else {
+          makeRegrTask(data = df_copy,
+                       target = 'target')
+        }
+        
+        #Make predictions from the model
+        preds <-
+          if(type == 'regr') {
+            predict(model, df_task)$data$response } else {
+              predict(model, df_task)$data[, paste0('prob.', p_var)]
+            }
+        
+        #Make into a data frame
+        preds <- data.frame(preds)
+        
+        #Rename column
+        colnames(preds) <- paste0(variable, '_', x)
+        
+        #Return the data
+        preds
+      }))
+    idf
+  })
+
+bigboi <- do.call("cbind.data.frame", bigboi)
+xxx <-
+  cbind.data.frame(
+    final_frame %>% dplyr::select(one_of(c(variables$ID, variables$TARGET))),
+    bigboi)
+
+#################################
+# ~ Extract the current odds table ~ #
+#################################
+
+repl_python()
+import json
+import requests
+import pandas as pd
+# Import the almighty, big-brain, and big-dicked json query function
+def get_json_value(x, y):
+  value = None
+  if x in y:
+    value = y[x]
+  return value
+# Enter API key
+api_key = '702ed26e5e683127f6f298a956b7f8d1'
+# Get the NBA Lines
+odds_response = requests.get('https://api.the-odds-api.com/v3/odds', params={'api_key': api_key,'sport': 'basketball_nba','region': 'us','mkt': 'spreads'})
+h2h_response = requests.get('https://api.the-odds-api.com/v3/odds', params={'api_key': api_key,'sport': 'basketball_nba','region': 'us','mkt': 'h2h'})
+totals_response = requests.get('https://api.the-odds-api.com/v3/odds', params={'api_key': api_key,'sport': 'basketball_nba','region': 'us','mkt': 'totals'})
+# Get the API response into a list
+odds_json = json.loads(odds_response.text)
+full_json = odds_json['data']
+full_json_h2h = json.loads(h2h_response.text)['data']
+full_json_totals = json.loads(totals_response.text)['data']
+# Define the lists we need for odds data
+home = []
+away = []
+h_spread = []
+a_spread = []
+h_points = []
+a_points = []
+h_moneyline = []
+a_moneyline = []
+over_under_total = []
+over_under_points = []
+for i in range(len(full_json)):
+  # Define the home and away team
+  home_team = get_json_value('teams', full_json[i])[0]
+  away_team = get_json_value('teams', full_json[i])[1]
+  # Do some bullshit to find the spreads because my brain too tired to create a better function
+  odds = get_json_value('sites', full_json[i])
+  try:
+    odds = get_json_value('odds', odds[0])
+  except IndexError:
+    continue
+  odds = get_json_value('spreads', odds)
+  final_odds = get_json_value('odds', odds)
+  final_spreads = get_json_value('points', odds)
+  
+  # Get the head to head values
+  h2h_odds = get_json_value('sites', full_json_h2h[i])
+  try:
+    odds = get_json_value('odds', h2h_odds[0])
+  except IndexError:
+    continue
+  odds_h2h = get_json_value('h2h', odds)
+  # Get the over/under values
+  total_odds = get_json_value('sites', full_json_totals[i])
+  try:
+    odds = get_json_value('odds', total_odds[0])
+  except IndexError:
+    continue
+  odds_totals = get_json_value('totals', odds)
+  totals_final_odds = get_json_value('odds', odds_totals)
+  total_final_spreads = get_json_value('points', odds_totals)
+  # Define the home and away points and spread
+  home_spread = final_spreads[0]
+  away_spread = final_spreads[1]
+  home_points = final_odds[0]
+  away_points = final_odds[1]
+  # Define the home and away money-line odds
+  home_money = odds_h2h[0]
+  away_money = odds_h2h[1]
+  # Define the over/under
+  over_under_odds = totals_final_odds[0]
+  over_under_p = total_final_spreads[0]
+  # Append everything to cute little lists
+  home.append(home_team)
+  away.append(away_team)
+  h_spread.append(home_spread)
+  a_spread.append(away_spread)
+  h_points.append(home_points)
+  a_points.append(away_points)
+  h_moneyline.append(home_money)
+  a_moneyline.append(away_money)
+  over_under_total.append(over_under_odds)
+  over_under_points.append(over_under_p)
+df = pd.DataFrame(list(zip(home, away, h_spread, a_spread, h_points, a_points, h_moneyline, a_moneyline, over_under_total, over_under_points)),
+                  columns =['Home_Team', 'Away_Team', 'Home_Spread', 'Away_Spread', 'Home_Points', 'Away_Points', 'Home_Moneyline', 'Away_Moneyline', 'Over_Under_Odds', 'Over_Under'])
+exit
+
+#Store the odds
+odds <-
+py$df %>%
+  mutate(Home_Team = api_name_table$CTG_TEAM[match(Home_Team, api_name_table$Team)],
+         Away_Team = api_name_table$CTG_TEAM[match(Away_Team, api_name_table$Team)]) %>%
+  dplyr::select(Team = Home_Team,
+                Opponent = Away_Team,
+                Spread = Home_Spread,
+                Home_Spread_Odds = Home_Points,
+                Away_Spread_Odds = Away_Points,
+                Home_Moneyline, Away_Moneyline,
+                Over_Under, Over_Under_Odds) %>%
+  mutate(Timestamp = now())
+
+#####################
+# ~ Store in Mongo ~ #
+#####################
+
+#Establish connection with mongo db
+con <-
+  mongo(
+    collection = "NFL",
+    db = 'NBA_LIVE_ODDS',
+    url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+  )
+
+con$insert(odds)
+rm(con)
+
+#####################
+# ~ Create the current prediction table ~ #
+#####################
+
+cur_pred_table <-
+mongo(
+  collection = "NFL",
+  db = 'NBA_SCHEDULE',
+  url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+)$find() %>%
+  mutate(Team = Home_Team,
+         Opponent = Away_Team,
+         Date = as.Date(Date)) %>%
+  filter(Date == as.Date(now())) %>%
+  dplyr::select(Date, Team, Opponent) %>%
+  left_join(
+    xxx, by = c('Date', 'Team', 'Opponent')
+  )
+
+#Throw the current prediction table into the historical table
+con <-
+  mongo(
+    collection = "NFL",
+    db = "NBA_HISTORICAL_PREDICTION_RESULTS",
+    url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+  )
+
+#yeah
+# hist_tbl <- con$find() %>% mutate(id = paste(Date, Team, Opponent, sep = '_'))
+# 
+# cur_pred_table %>%
+#   mutate(id = paste(Date, Team, Opponent, sep = '_')) %>%
+#   filter(id %in% hist_tbl == F)
+
+
+con$insert(cur_pred_table %>% mutate(Set = "Production"))
+
+#####################
+# ~ 
+#####################
+
+cur_pred_table <-
+cur_pred_table %>%
+  dplyr::select(-one_of(c('id', 'Spread', 'Over_Under', 'Total_Points', 'Points', 'Points_Alwd', 'Over_Under_Coverage',
+                          'Over_Under_Differential', 'Point_Differential', 'Spread_Differential', 'Spread_Coverage', 'Win_Loss'))) %>%
+  left_join(odds %>%
+              mutate(Team1 = ifelse(Team %in% cur_pred_table$Team, as.character(Team), as.character(Opponent)),
+                     Opponent1 = ifelse(Opponent %in% cur_pred_table$Opponent, as.character(Opponent), as.character(Team)),
+                     Team = Team1,
+                     Opponent = Opponent1) %>%
+              dplyr::select(-Team1, -Opponent1), by = c('Team', 'Opponent')) %>%
+  na.omit()
+
+#Drop/Insert into the table
+#Throw the current prediction table into the historical table
+con <-
+  mongo(
+    collection = "NFL",
+    db = "NBA_CURRENT_PREDICTION_TABLE",
+    url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+  )
+
+con$drop()
+con$insert(cur_pred_table)
+rm(con)
