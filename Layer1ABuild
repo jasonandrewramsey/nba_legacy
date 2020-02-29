@@ -1,0 +1,301 @@
+#Here is how the process is going to work
+
+#Layer 1a - Train many models to predict:
+#1. Point Differential (Continuous)
+#2. Total Game Points (Continuous)
+#3. Win Probability (Classification)
+
+#Reduce each model output into an N size batch of good fits (the least overfit batch with good accuracy)
+
+#Layer 1b - Train many models on the output of Layer 1a selected model outputs to get 1 output per variable (best fit) 
+
+#Add features from the models created in Layer 1b
+
+#Layer 2a - Train many models to predict:
+#1. Point Differential (Continuous)
+#2. Total Game Points (Continuous)
+#3. Spread Differential (Continuous)
+#4. Over Under Differential (Continuous)
+#5. Spread Coverage Probability (Classification)
+#6. Over Under Coverage Probability (Classification)
+#7. Win Probability (Classification)
+
+#Layer 2b - Train many models on the output of Layer 2a selected model outputs to get 1 output per variable (best fit)
+
+
+#Selection Criteria
+#Comb through each of the models outputted for Layer 2b to select the model that gives the highest ROE when utilized on Test Days
+
+
+#####################
+# ~ Run Source packages ~ #
+#####################
+
+#Run the functions for scripts
+source('H:/NBA/Scripts/Package_Import.R')
+source('H:/NBA/Scripts/Statistical_Functions.R')
+source('H:/NBA/Scripts/Model_Functions.R')
+
+#################################
+# ~ Read in the pre processed dataset ~ #
+#################################
+
+username <- 'thatsmrlongcut'
+password <- 'football17'
+
+con <-
+  mongo(
+    collection = "NFL",
+    db = "NBA_PRE_PROCESS",
+    url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+  )
+
+df <- con$find()
+
+#################################
+# ~ Define the target variables now ~ #
+#################################
+
+variables <- list(
+  TARGET = c('Spread', 'Over_Under', 'Total_Points', 'Points', 'Points_Alwd', 'Over_Under_Coverage', 'Over_Under_Differential',
+              'Point_Differential', 'Spread_Differential', 'Spread_Coverage', 'Win_Loss'),
+  ID = c('Set', 'Date', 'Team', 'Opponent'),
+  
+  COMMON = c('Home_Away', 'Season_Days', 'Month')
+)
+
+#################################
+# ~ Merge with their opponents information ~ #
+#################################
+
+df <- 
+  df %>%
+  left_join(df %>%
+              mutate(Team = Opponent) %>%
+              dplyr::select(one_of(c('Date', 'Team', colnames(df)[!(colnames(df) %in% (do.call("c", variables) %>% as.character))]))),
+            by = c('Date', 'Team'), suffix = c('', '_OPP')) %>%
+  compare_cols2(., '_OPP')
+
+#################################
+# Construct the Splits #
+#################################
+
+#Filter for just layer 1 and add id
+df <- 
+  df %>%
+  mutate(id = row_number()) %>%
+  filter(Set == 'Layer 1')
+
+#Layer 1 id's [Use Point Differential just to get the observations]
+set.seed(100)
+a_rows <- createDataPartition(df[,'Point_Differential'], p = 0.6, list = FALSE)
+
+#Reduce the data frame for the layer 1 observations
+df_a <- df[a_rows,]
+
+#Split layer 1 into train/test .. this dataset will be used by all variables
+trainRowNumbers <- createDataPartition(df_a[,'Point_Differential'], p = 0.8, list = FALSE)
+
+sets <- list(
+  Train = df_a[trainRowNumbers,],
+  Test = df_a[-trainRowNumbers,]
+)
+
+#Establish the path to drop the Layer 1 a Models
+path <- 'H:/NBA/Model Build/Layer 1/a/'
+
+#Store the splits for Layer 1 a
+saveRDS(list(
+  PARENT_SPLIT = data.frame(row_id = a_rows, df_id = df$id[a_rows]),
+     
+  SUB_TEST_TRAIN_SPLIT = df_a %>%
+    dplyr::select(id) %>%
+    mutate(Set = ifelse(id %in% sets$Train$id, 'Train', 'Test'))
+), paste0(path, 'splits.rds'))
+
+
+#################################
+# Construct Target Variables #
+#################################
+
+#Target variables
+y_vars <- variables$TARGET
+
+#Positive Classes (for classification)
+pos_classes <- c(NA, NA, NA, NA, NA, 'over', NA, NA, NA, 'covered', 'win')
+
+#################################
+# Iterate through and build some fucking models ~
+#################################
+
+for(k in 11:length(y_vars)) {
+  #Assign the target variable
+  target_variable <- y_vars[k]
+  
+  #Make a copy of the sets
+  data_copy <- sets
+  
+  #Rename the target variable in the copied data
+  for(i in 1:length(data_copy)) {
+    colnames(data_copy[[i]])[match(target_variable, colnames(data_copy[[i]]))] <- 'target'
+  }
+  
+  #Make the target variable name consistent
+  y <- 'target'
+  
+  #Declare the variables to be dropped
+  drop_vars <- do.call("c", variables[1:2]) %>% as.character
+  
+  #Declare the identity column
+  id <- 'id'
+  
+  #Define the X variables
+  X <- colnames(data_copy$Train)[!(colnames(data_copy$Train) %in% c(y, id, drop_vars))]
+  
+  #Reduce the sets to just these variables
+  data_copy <- lapply(1:length(data_copy), function(i) {
+    data_copy[[i]] %>%
+      dplyr::select(one_of(c(id, y, X)))
+  })
+  
+  #If the target variable is numeric or integer -- do nothing, 
+  class_y <- class(data_copy[[1]][,y])
+  if(class_y %in% c('integer', 'numeric')) {
+    class_y <- 'regr'
+  } else {
+    class_y <- 'classif'
+    #Otherwise -- find the top 2 most frequent -- and make the others apart of the minority class
+    #To make it 2 factor
+    classes <- names(sort(table(data_copy[[i]][,y]), decreasing = TRUE))[1:2]
+    
+    #Eliminate everything that isn't in these classes
+    for(i in 1:length(data_copy)) {
+      data_copy[[i]][which(data_copy[[i]][,y] %in% classes == F),y] <- classes[2]
+    }
+  }
+  
+  ###############FUCKKKCKKCKCKCK
+  #The only categorical variable is Home_Away, which i should have made into a binary variable in a previous script - do it fucking here
+  #And you will forget you did it here and it will cause an error in model build GUARANTEE it
+  for(i in 1:length(data_copy)) {
+    data_copy[[i]] <- data_copy[[i]] %>% mutate(Home_Away = ifelse(Home_Away == 'Home', 1, 0))
+  }
+  
+  ###############
+  # Pre Processing #
+  ###############
+  
+  #Near Zero variance
+  nzv <- unique(do.call("c", lapply(1:length(data_copy), function(i) {
+    nearZeroVar(data_copy[[i]][, -(match(y, colnames(data_copy[[i]])))], names = TRUE)
+  })))
+  
+  #Remove the near zero variance columns
+  if(length(nzv) > 0) {
+    for(i in 1:length(data_copy)) {
+      data_copy[[i]] <- data_copy[[i]][, !(colnames(data_copy[[i]]) %in% nzv)]
+    }
+  }
+  
+  #Now remove the remaining NA rows (if there are any)
+  for(i in 1:length(data_copy)) {
+    data_copy[[i]] <- data_copy[[i]] %>% 
+      na.omit()
+  }
+  
+  #Find highly correlated variables
+  fc <- 
+    unique(
+      do.call("c", 
+              lapply(1:length(data_copy), function(i) {
+                #Correlation matrix
+                mCor <- cor(data_copy[[i]][,-(match(y, colnames(data_copy[[i]])))])
+                #Find correlation
+                findCorrelation(mCor, cutoff = 0.75, exact = TRUE, names = TRUE)
+              })))
+  
+  if(length(fc) > 0) {
+    for(i in 1:length(data_copy)) {
+      data_copy[[i]] <- data_copy[[i]][, !(colnames(data_copy[[i]]) %in% fc)]
+    }
+  }
+  
+  ###############
+  # Create the Task #
+  ###############
+  
+  #Create the task
+  task <- lapply(1:length(data_copy), function(i) {
+    if(class_y == 'regr') {
+      makeRegrTask(
+        data = data_copy[[i]] %>%
+          dplyr::select(-one_of('id')),
+        target = y
+      )
+    } else {
+      makeClassifTask(
+        data = data_copy[[i]] %>%
+          dplyr::select(-one_of('id')),
+        target = y, positive = pos_classes[k]
+      )
+    }
+  })
+  
+  ###############
+  # Set the Tuning Parameters #
+  ###############
+  
+  #Set the hyper parameter search criteria
+  rancontrol <- makeTuneControlRandom(maxit = 300L)
+  
+  #Set 3 Fold Cross Validation
+  set_cv <- makeResampleDesc("CV", iters = 3L)
+  
+  #Define the number of times you want to iterate
+  n_iterations <- 2
+  
+  #Define the maximum iterations
+  n_max <- 300
+  
+  ###############
+  # Build the Models #
+  ###############
+  
+  rf_build <- rf_iterate(n_iterations, n_max, task, set_cv, rancontrol)
+  xgb_build <- xgb_iterate(rf_build, n_iterations, task, set_cv, rancontrol)
+  lm_build <- lm_iterate(rf_build, task)
+  
+  #Combine
+  builds <- do.call("c", list(
+    rf = rf_build,
+    xgb = xgb_build,
+    lm = lm_build
+  ))
+  
+  #Initial reduction to the best 5 models
+  best_builds <-
+    builds %>%
+    map(2) %>%
+    map2_df(., names(.), ~ mutate(.x, ID = .y)) %>%
+    melt(id.vars = c('ID', 'Set')) %>%
+    spread(Set, value) %>%
+    split(., .$variable) %>%
+    map(., ~mutate(., DELTA = -1*(Test - Train)^2)) %>%
+    map(., ~mutate_at(., c('Train', 'Test'), ~. * ifelse(class_y == 'regr', -1, 1))) %>%
+    map(., ~pProc(., c('ID', 'variable', 'Train'), "range")) %>%
+    invoke(rbind, .) %>%
+    dplyr::select(-variable) %>%
+    melt(id.vars = 'ID') %>%
+    group_by(ID) %>%
+    summarise(AVG = mean(value)) %>%
+    arrange(desc(AVG)) %>%
+    top_n(5, AVG) %>%
+    .$ID %>%
+    as.character
+  
+  ###############
+  # Save the Models
+  ###############
+  
+  saveRDS(builds[best_builds], paste0(path, target_variable, '.rds'))
+}
