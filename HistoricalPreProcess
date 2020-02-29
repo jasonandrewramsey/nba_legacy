@@ -1,0 +1,294 @@
+# !diagnostics off
+
+#####################
+# ~ Run Source packages ~ #
+#####################
+
+#Run the functions for scripts
+source('H:/NBA/Scripts/Package_Import.R')
+source('H:/NBA/Scripts/Statistical_Functions.R')
+source('H:/NBA/Scripts/Model_Functions.R')
+
+#####################
+# ~ Import tables ~ #
+#####################
+
+#Index of table names in mongo to environment names in R
+index <-
+  data.frame(
+    MONGODB_NAME = c('CTG_TEAM', 'CTG_PLAYER', 'CTG_GENERAL_NAME_CONVERT', 'CTG_TEAM_TABLE_NAME_CONVERT', 'CTG_PLAYER_TABLE_NAME_CONVERT', 
+                     'BETTING_TABLE_TEAM_CONVERT', 'BETTING_TABLE', 'STADIUM_COORDINATES'),
+    ENV_NAME = c('team_data', 'player_data', 'ctg_name_convert', 'ctg_team_defunct_names', 'ctg_player_defunct_names',
+                 'betting_table_names', 'lines', 'stadium_coords'),
+    stringsAsFactors = FALSE
+  )
+
+#Credentials
+username <- 'thatsmrlongcut'
+password <- 'football17'
+
+#Run a loop and import/assign
+for(i in 1:nrow(index)) {
+  #Establish connection with mongo db
+  con <-
+    mongo(
+      collection = "NFL",
+      db = index$MONGODB_NAME[i],
+      url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+    )
+  #Assign object
+  assign(index$ENV_NAME[i], con$find(), envir = .GlobalEnv)
+  rm(con)
+}
+
+#################################
+# ~ Structure Spread Info ~ #
+#################################
+
+#Clean up the initial line table
+lines <-
+  lines %>%
+  #clean variables
+  mutate(Date = as.Date(Game_Date, format = '%m/%d/%Y'),
+         Home_Team = betting_table_names$CTG_TEAM[match(Home_Team, betting_table_names$NAME)],
+         Away_Team = betting_table_names$CTG_TEAM[match(Away_Team, betting_table_names$NAME)],
+         Total_Points = Home_Points + Away_Points,
+         Spread = Home_Spread,
+         Over_Under = Total_Line) %>%
+  dplyr::select(Date, Home_Team, Away_Team, Home_Points, Away_Points, Spread, Over_Under, Total_Points)
+
+#Melt into one long format -- team opponent, etc
+ha_ids <- c("Home_Team", "Away_Team")
+
+matchups <- 
+  do.call("rbind", lapply(1:length(ha_ids), function(x) {
+    lines %>%
+      dplyr::select(one_of(c('Date', 'Home_Team', 'Away_Team', 'Spread', 'Over_Under', 'Total_Points', paste0(gsub("_Team", "", ha_ids[x]), '_Points')))) %>%
+      mutate(Home_Away = gsub("_Team", "", ha_ids[x])) %>%
+      setNames(gsub(ha_ids[-x], "Opponent", names(.))) %>%
+      setNames(gsub(ha_ids[x], "Team", names(.))) %>%
+      setNames(gsub(paste0(gsub("_Team", "", ha_ids[x]), '.Points'), "Points", names(.)))
+  })) %>%
+  mutate(Points_Alwd = Total_Points - Points,
+         #Easy enough -- calculate the amount the Over Under was covered by, and binary whether they did or not
+         Over_Under_Coverage = ifelse(Total_Points == Over_Under, 0.5, ifelse(Total_Points > Over_Under, 1, 0)),
+         Over_Under_Differential = Total_Points - Over_Under,
+         #Spread is a bit odd because it depends on Home/Away -- Spread is quoted in terms of the home team
+         Point_Differential = Points - Points_Alwd,
+         Spread = ifelse(Home_Away == 'Home', Spread, -1*Spread),
+         Spread_Differential = Point_Differential + Spread,
+         Spread_Coverage = ifelse(Spread_Differential == 0, 0.5, ifelse(Spread_Differential > 0, 1, 0))) %>%
+  #Get rid of the variables that are present in the team data, that you don't need to merge
+  dplyr::select(-Opponent, -Home_Away, -Points, -Points_Alwd)
+
+####You can check if this did what you expected by:
+####summing the differential -- should equate to 0
+#sum(matchups$Spread_Differential)
+####Grouping and looking at the matrix -- should be inverse or a mirror looking mug
+# matchups %>%
+#   group_by(Home_Away, Spread_Coverage) %>%
+#   summarise(count = n()) %>%
+#   spread(Home_Away, count)
+
+#For the trailing average calculation -- grab all the numeric fields in the matchups table (will be added to the separate calculation for team data)
+numeric_fields_spread <- colnames(matchups)[which(do.call("c", lapply(matchups, is.numeric)))]
+
+#####################
+# ~ Team Data Structuring ~ #
+#####################
+
+#Define all the numeric fields in the data frame initially -- these are all we want to compare
+numeric_fields_team <- colnames(team_data)[which(do.call("c", lapply(team_data, is.numeric)))]
+
+#Clean up the initial team data extract
+team_data <-
+team_data %>%
+  mutate(
+    #Defunct name convert
+    Team = ifelse(Team %in% ctg_team_defunct_names$old_team_name, ctg_team_defunct_names$new_team_name[match(Team, ctg_team_defunct_names$old_team_name)], as.character(Team)),
+    Opponent = ifelse(Opponent %in% ctg_team_defunct_names$old_team_name, ctg_team_defunct_names$new_team_name[match(Opponent, ctg_team_defunct_names$old_team_name)], as.character(Opponent)),
+    
+    #Convert date to date/Season info
+    Date = as.Date(Date),
+    Season = ifelse(yday(Date) < 200, year(Date), year(Date)+1),
+    
+    #Add scalar
+    scalar = 1
+  ) %>%
+  
+  #Add a rolling game count in the season -- we don't want to include playoffs
+  group_by(Team, Season) %>%
+  mutate(Game_Count = cumsum(scalar)) %>%
+  as.data.frame %>%
+  filter(Game_Count <= ifelse(Season == 2012, 66, 82)) %>% #2012 was a shortened year, regular season ends after 82 games -- i dont think we have all of 2004 but idgaf
+  as.data.frame %>%
+  
+  #Get rid of the scalar/ and id
+  dplyr::select(-scalar, -id, -Game_Count)
+
+#####################
+# ~ Team Data & Spread Trailing Averages ~ #
+#####################
+
+#Combine both numeric fields
+numeric_fields <- c(numeric_fields_spread, numeric_fields_team)
+
+#Merge team and spread/matchups data
+team_spread_data <- 
+  team_data %>%
+  left_join(matchups, by = c('Date', 'Team'))
+
+#Create the trailing average sequence
+trailing_average_sequence <- c(5, 15, 25, 45, 65)
+
+#You will need to speed this up -- assign multiple cores to do this task
+cl <- makeCluster(detectCores(), type = "SOCK")
+
+#Export the required objects to the other clusters
+clusterExport(cl, list(
+  "team_spread_data", "numeric_fields", "trailing_average_sequence"
+))
+
+#Cluster apply the trailing average composition
+trailing_avg_bin <-
+         clusterApply(cl, 1:length(trailing_average_sequence), function(z) {
+           source('H:/NBA/Scripts/Package_Import.R')
+           source('H:/NBA/Scripts/Statistical_Functions.R')
+           team_spread_data %>% trail_stat_combine(., numeric_fields, trailing_average_sequence[z])
+         })
+
+#Stop the cluster
+stopCluster(cl)
+
+#Perform the base difference calculations
+trailing_avg_bin <- base_dif_calc(trailing_avg_bin, trailing_average_sequence)
+
+#Define the variables you want scaled to the rest of the league
+vars_to_scale <- 
+  trailing_avg_bin %>%
+  dplyr::select(-Team, -Date) %>%
+  names(.)
+
+#You will need to speed this up -- assign multiple cores to do this task
+cl <- makeCluster(detectCores(), type = "SOCK")
+
+#Export the required objects to the other clusters
+clusterExport(cl, list(
+  "trailing_avg_bin", "vars_to_scale"
+))
+
+#Cluster apply scale those fuckers
+trailing_avg_bin <-
+  Reduce(merge, 
+         clusterApply(cl, 1:length(vars_to_scale), function(z) {
+           source('H:/NBA/Scripts/Package_Import.R')
+           source('H:/NBA/Scripts/Statistical_Functions.R')
+           scale_var(trailing_avg_bin, vars_to_scale[z])
+         }))
+
+#Stop the cluster
+stopCluster(cl)
+
+#################################
+# ~ Compute Streaks the Team is on ~ #
+#################################
+
+#Find the vars to compute streaks
+streak_vars <-
+  do.call("c", plyr::compact(lapply(1:ncol(team_data), function(i) {
+    if(paste0(colnames(team_data)[i], '_Alwd') %in% colnames(team_data)) {
+      colnames(team_data)[i]
+    }
+  })))
+
+#Compute the streaks
+streaks <- streak_function(team_data, streak_vars)
+
+#################################
+# ~ Compute Player Info ~ #
+#################################
+
+#Just note this is an unbelievably poor attempt at giving even a shred of a fucking shit about making player data super useful
+#It would take a long time and a lot of research to attempt to make something that has marginal improvement than this on the end model
+#So fuckkkk it
+
+#Read in the player data and compute starter/sitter averages
+player_data <-
+  player_data %>%
+  #Fix team names
+  mutate(Team = ifelse(Team %in% ctg_name_convert$NAME, ctg_name_convert$CTG_TEAM[match(Team, ctg_name_convert$NAME)], 
+                       ctg_player_defunct_names$new_team_name[match(Team, ctg_player_defunct_names$old_team_name)])) %>%
+  dplyr::select(-id) %>%
+  #Get the totals for each of the bins
+  group_by(Team, Date) %>%
+  mutate_at(c('PTS', 'REB', 'AST', 'FGM', 'FGA', 'FGM_3P', 'FGA_3P', 'FTM', 'FTA'), list(TOT = ~sum(., na.rm = T))) %>%
+  as.data.frame %>%
+  pct_team_tot("_TOT") %>%
+  split(.$Player) %>%
+  map(~cum_avg_stats(.)) %>%
+  invoke(rbind, .) %>%
+  group_by(Date, Team, STARTER) %>%
+  mutate(MIN_PCT = TOT_MIN/sum(TOT_MIN)) %>%
+  summarise_at(c('AST_PCT', 'BLK_PCT', 'PTS', 'ASTD_PCT', 'fgDR_PCT', 'fgOR_PCT', 'MIN', 'PSA', 'STL_PCT', 'TOV_PCT', 
+                 'Usage', 'REB', 'AST', 'FGM', 'FGA', 'FGM_3P', 'FGA_3P', 'FTM', 'FTA', 'PTS_PCT_TM', 'REB_PCT_TM',
+                 'AST_PCT_TM', 'FGM_PCT_TM', 'FGA_PCT_TM', 'FGM_3P_PCT_TM', 'FGA_3P_PCT_TM', 'FTM_PCT_TM', 'FTA_PCT_TM',
+                 'TOT_GMS', 'TOT_MIN'),  ~sum(. * MIN_PCT)) %>%
+  spread_starters()
+
+#Define the variables you want scaled buddy
+vars_to_scale <- 
+  player_data %>%
+  dplyr::select(-Team, -Date) %>%
+  names(.)
+
+#You will need to speed this up -- assign multiple cores to do this task
+cl <- makeCluster(detectCores(), type="SOCK")
+
+#Export the required objects to the other clusters
+clusterExport(cl, list(
+  "player_data", "vars_to_scale"
+))
+
+#Cluster apply scale those fuckers
+player_data <-
+  Reduce(merge, 
+         clusterApply(cl, 1:length(vars_to_scale), function(z) {
+           source('H:/NBA/Scripts/Package_Import.R')
+           source('H:/NBA/Scripts/Statistical_Functions.R')
+           scale_var(player_data, vars_to_scale[z])
+         }))
+
+#Stop the cluster
+stopCluster(cl)
+
+#################################
+# ~ Travel Distance ~ #
+#################################
+
+#Modify the coordinates making them a nested vector
+stadium_coords <-
+  stadium_coords %>%
+  rowwise() %>%
+  mutate(Coordinates = list(c(Longitude, Latitude)))
+
+#Create the distance traveled from last game to this game data frame
+distance_traveled_df <-
+team_data %>%
+  arrange(Date) %>%
+  dplyr::select(Date, Team, Opponent, Home_Away) %>%
+  group_by(Team) %>%
+  mutate(Last_Game_Location = ifelse(shift(Home_Away) == 'Home', 
+                                     stadium_coords$Coordinates[match(shift(Team), stadium_coords$CTG_TEAM)],  
+                                     stadium_coords$Coordinates[match(shift(Opponent), stadium_coords$CTG_TEAM)]),
+         Current_Game_Location = ifelse(Home_Away == 'Home', 
+                                        stadium_coords$Coordinates[match(Team, stadium_coords$CTG_TEAM)],  
+                                        stadium_coords$Coordinates[match(Opponent, stadium_coords$CTG_TEAM)])) %>%
+  as.data.frame %>%
+  rowwise() %>%
+  mutate(Valid_Coordinates = sum(is.na(unlist(Last_Game_Location))),
+         Distance_Traveled = ifelse(Valid_Coordinates != 0, NA, distm(unlist(Last_Game_Location), unlist(Current_Game_Location)))) %>%
+  as.data.frame %>%
+  dplyr::select(Date, Team, Distance_Traveled) %>%
+  #Now do bulk calculation on distance traveled per day
+  dist_per_day_bulk(., c(1, 3, 5, 10, 15, 25, 35, 50))
+
