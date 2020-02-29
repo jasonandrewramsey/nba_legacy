@@ -1,0 +1,123 @@
+#####################
+# ~ Run Source packages ~ #
+#####################
+
+#First call the package import/load script
+source('H:/NBA/Scripts/Package_Import.R')
+
+#####################
+# ~ Import tables ~ #
+#####################
+
+#Index of table names in mongo to environment names in R
+index <-
+  data.frame(
+    MONGODB_NAME = c('CTG_TEAM', 'CTG_PLAYER', 'CTG_GENERAL_NAME_CONVERT', 'CTG_TEAM_TABLE_NAME_CONVERT', 'CTG_PLAYER_TABLE_NAME_CONVERT', 
+                     'BETTING_TABLE_TEAM_CONVERT', 'BETTING_TABLE', 'STADIUM_COORDINATES', 'API_NAME_TABLE', 'NBA_SCHEDULE'),
+    ENV_NAME = c('team_data', 'player_data', 'ctg_name_convert', 'ctg_team_defunct_names', 'ctg_player_defunct_names',
+                 'betting_table_names', 'lines', 'stadium_coords', 'api_name_table', 'schedule'),
+    stringsAsFactors = FALSE
+  )
+
+#Credentials
+username <- 'thatsmrlongcut'
+password <- 'football17'
+
+#Establish connection with mongo db
+con <-
+  mongo(
+    collection = "NFL",
+    db = "BETTING_TABLE_TEAM_CONVERT",
+    url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+  )
+
+#Assign object
+betting_table_names <- con$find()
+rm(con)
+
+#####################
+# ~ Extract table ~ #
+#####################
+
+#Function to start an automated browser port
+start_selenium <- function() {
+  assign("rD", { tryCatch({ rsDriver(port = as.integer(4000+sample(1:3000,1)), 
+                                     browser = "chrome",
+                                     version = "3.141.5",
+                                     chromever = "78.0.3904.105") },
+                          error = function(e) { rsDriver(port = as.integer(4000+sample(1:3000,1)), 
+                                                         browser = "chrome",
+                                                         version = "3.141.5",
+                                                         chromever = "76.0.3809.12") }) },
+         envir = .GlobalEnv)
+  
+  assign("remDr", rD$client, envir = .GlobalEnv)
+}
+
+#Assuming this is ran everyday, the date will be yesterday
+dt <- format(as.Date(now(tz = "EST")-(24*60*60)), "%Y%m%d")
+#as.Date(now(tz = "EST")-(24*60*60))
+
+#Start the browser
+start_selenium()
+
+#Go to the page
+remDr$navigate('https://sportsdatabase.com/nba/query?output=default&sdql=&submit=++S+D+Q+L+%21++')
+Sys.sleep(3)
+#Find the query box
+sdql <- remDr$findElement(using = "id", value = "sdql")
+#Send the query
+sdql$sendKeysToElement(list(paste0("date=", dt),
+                            "\uE007"))
+Sys.sleep(3)
+
+#Scrape the tables
+tables <-
+  remDr$getPageSource() %>%
+  map(1) %>%
+  unlist() %>%
+  read_html() %>%
+  html_table(fill = T)
+
+#Find which one is the one you want
+target_frame <- which(do.call("c", lapply(1:length(tables), function(x) {
+  sum(colnames(tables[[x]]) == "Date")
+})) == 1)
+
+#Filter out everything and structure
+df <- 
+  tables[[target_frame]] %>%
+  filter(Site == 'home') %>%
+  mutate(Date = as.Date(Date, format = '%b %d, %Y'),
+         Home_Team = betting_table_names$CTG_TEAM[match(Team, betting_table_names$NAME)],
+         Away_Team = betting_table_names$CTG_TEAM[match(Opp, betting_table_names$NAME)],
+         Spread = Line, Over_Under = Total) %>%
+  separate(Final, into = c('Home_Points', 'Away_Points')) %>%
+  mutate(Home_Points = as.numeric(Home_Points),
+         Away_Points = as.numeric(Away_Points),
+         Total_Points = Home_Points + Away_Points) %>%
+  dplyr::select(Date, Home_Team, Away_Team, Home_Points, Away_Points, Spread, Over_Under, Total_Points)
+
+#Now insert into mongo if it isn't present already
+username <- 'thatsmrlongcut'
+password <- 'football17'
+
+con <-
+  mongo(
+    collection = "NFL",
+    db = 'BETTING_TABLE',
+    url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+  )
+
+#Find all of the ids in the table
+dates <- con$distinct('Date', query = '{}')
+
+#If the date isn't present than insert the data frame
+if(as.character(df$Date[1]) %in% dates == FALSE) {
+  con$insert(df)
+}
+
+rm(con)
+remDr$close()
+
+  
