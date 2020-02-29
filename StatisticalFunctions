@@ -1,0 +1,448 @@
+#Create a function that will compute the trailing averages for a specific set of variables
+#Requires a column for 'Team' and 'Date' -- those are the ids it uses
+trail_means <- function(.data, vars, N) {
+  .data %>%
+    dplyr::select(one_of(c('Team', 'Date', vars))) %>%
+    arrange(Date) %>%
+    group_by(Team) %>%
+    mutate_at(vars(-Date, -Team), ~rollapplyr(., N, mean, fill = NA, na.rm = T)) %>%
+    mutate_at(vars(-Date, -Team), shift) %>%
+    as.data.frame
+}
+
+#Function to compare to columns and return the difference
+compare_cols <- function(.data, suffix) {
+  idf <- .data
+  
+  #Grab columns that will remain
+  non_comparables <- 
+    colnames(idf) %>%
+    as.data.frame %>%
+    rowwise() %>%
+    mutate(red = gsub(suffix, "", .)) %>%
+    as.data.frame %>%
+    group_by(red) %>%
+    summarise(count = n()) %>%
+    filter(count == 1) %>%
+    .$red %>%
+    as.character
+  
+  cbind.data.frame(idf[,non_comparables], 
+                   do.call("cbind.data.frame", plyr::compact(lapply(1:ncol(idf), function(x) {
+                     if(paste0(colnames(idf)[x], suffix) %in% colnames(idf)) {
+                       pos <- match(paste0(colnames(idf)[x], suffix), colnames(idf))
+                       
+                       jdf <- 
+                         ((idf[,x] - idf[,pos])/
+                            idf[,pos]) * 100
+                       
+                       jdf <- jdf %>% as.data.frame
+                       colnames(jdf) <- colnames(idf)[x]
+                       return(jdf)
+                     }
+                   }))))
+  
+}
+
+#Function to compare to columns and return the difference
+compare_cols2 <- function(.data, suffix) {
+  idf <- .data
+  
+  #Grab columns that will remain
+  non_comparables <- 
+    colnames(idf) %>%
+    as.data.frame %>%
+    rowwise() %>%
+    mutate(red = gsub(suffix, "", .)) %>%
+    as.data.frame %>%
+    group_by(red) %>%
+    summarise(count = n()) %>%
+    filter(count == 1) %>%
+    .$red %>%
+    as.character
+  
+  cbind.data.frame(idf[,non_comparables], 
+                   do.call("cbind.data.frame", plyr::compact(lapply(1:ncol(idf), function(x) {
+                     if(paste0(colnames(idf)[x], suffix) %in% colnames(idf)) {
+                       pos <- match(paste0(colnames(idf)[x], suffix), colnames(idf))
+                       
+                       jdf <- 
+                         (idf[,x] - idf[,pos])
+                       
+                       jdf <- jdf %>% as.data.frame
+                       colnames(jdf) <- colnames(idf)[x]
+                       return(jdf)
+                     }
+                   }))))
+  
+}
+
+#Create a function that will compare a team's performance relative to their trailing average in the past N games
+#Requires a column for 'Team' and 'Date' -- those are the ids it uses
+trail_relative_performance <- function(.data, index_df, N) {
+  #Grab the vars required
+  .data %>%
+    dplyr::select(one_of(colnames(index_df))) %>%
+    left_join(index_df,
+              by = c('Date', 'Team'),
+              suffix = c('', paste0('_TM'))) %>%
+    compare_cols(paste0('_TM')) %>%
+    group_by(Team) %>%
+    mutate_at(vars(-Date, -Team), ~rollapplyr(., N, mean, fill = NA, na.rm = T)) %>%
+    mutate_at(vars(-Date, -Team), shift) %>%
+    as.data.frame
+}
+
+#Create a function that will compare what the team has been allowing to their opponent's trailing average (Defense)
+#Requires column for 'Team' 'Opponent' and 'Date' - these are the ids it uses
+trail_relative_defense <- function(.data, index_df, vars, N) {
+  .data %>%
+    dplyr::select(one_of(c('Team', 'Opponent', 'Date', vars))) %>%
+    setNames(gsub("_Alwd", "", names(.))) %>%
+    left_join(
+      index_df %>% 
+        mutate(Opponent = Team) %>% 
+        dplyr::select(one_of(c('Opponent', 'Date', 'Team', colnames(index_df)[!(colnames(index_df) %in% vars)]))) %>%
+        dplyr::select(-Team),
+      by = c('Opponent', 'Date'), suffix = c("", "_OPP_TAVG")
+    ) %>%
+    compare_cols("_OPP_TAVG") %>%
+    group_by(Team) %>%
+    mutate_at(vars(-Date, -Team, -Opponent), ~rollapplyr(., N, mean, fill = NA, na.rm = T)) %>%
+    mutate_at(vars(-Date, -Team, -Opponent), shift) %>%
+    as.data.frame
+}
+
+#Create a function that will compare what the team has been averaging to their opponent's trailing average (Offense)
+#Requires column for 'Team' 'Opponent' and 'Date' - these are the ids it uses
+trail_relative_offense <- function(.data, index_df, vars, N) {
+  .data %>%
+    dplyr::select(one_of(c('Team', 'Opponent', 'Date', vars))) %>%
+    left_join(
+      index_df %>% 
+        mutate(Opponent = Team) %>% 
+        dplyr::select(one_of(c('Opponent', 'Date', 'Team', colnames(index_df)[!(colnames(index_df) %in% vars)]))) %>%
+        setNames(gsub("_Alwd", "", names(.))) %>%
+        dplyr::select(-Team),
+      by = c('Opponent', 'Date'), suffix = c("", "_OPP_TAVG")
+    ) %>%
+    compare_cols("_OPP_TAVG") %>%
+    group_by(Team) %>%
+    mutate_at(vars(-Date, -Team, -Opponent), ~rollapplyr(., N, mean, fill = NA, na.rm = T)) %>%
+    mutate_at(vars(-Date, -Team, -Opponent), shift) %>%
+    as.data.frame
+}
+
+#Create the function that will perform all of this for you
+trail_stat_combine <- function(.data, vars, N) {
+  #Grab the variable combinations
+  alwd_vars <- vars[grepl('_Alwd', vars)]
+  scrd_vars <- vars[!(grepl('_Alwd', vars))]
+  
+  #Simple averages
+  trail_mean_df <- .data %>% trail_means(., vars, N)
+  
+  #Trailing relative performance
+  trail_rel_perf_df <- .data %>% trail_relative_performance(., trail_mean_df, N)
+  
+  #Trailing relative allowing comparison (defense)
+  trail_rel_def_df <- .data %>% trail_relative_defense(., trail_mean_df, alwd_vars, N)
+  
+  #Trailing relative scoring comparison (offense)
+  trail_rel_off_df <- .data %>% trail_relative_offense(., trail_mean_df, scrd_vars, N)
+  
+  #Merge all 4 of the frames together
+  trail_mean_df %>%
+    left_join(trail_rel_perf_df, by = c("Date", "Team"), suffix = c("", "REL_PERF")) %>%
+    left_join(trail_rel_def_df %>% dplyr::select(-Opponent), by = c("Date", "Team"), suffix = c("", "_REL_DEF")) %>%
+    left_join(trail_rel_off_df %>% dplyr::select(-Opponent), by = c("Date", "Team"), suffix = c("", "_REL_OFF"))
+}
+
+#Function to take differences off of the base
+base_dif_calc <- function(list_of_averages, trailing_sequences) {
+  #Identify the base -- what to base everything off of
+  base_index <- length(list_of_averages)-2
+  base_df <- list_of_averages[[base_index]]
+  base_length <- trailing_sequences[base_index]
+  
+  #Remove the base index from the list
+  list_of_averages <- list_of_averages[-base_index]
+  trailing_sequences <- trailing_sequences[-base_index]
+  
+  #Create the end frame
+  end_frame <- base_df
+  
+  #Now perform the comparisons amongst the rest
+  for(x in 1:length(list_of_averages)) {
+    end_frame <- end_frame %>%
+      left_join(
+        base_df %>%
+          left_join(list_of_averages[[x]], by = c('Date', 'Team'), suffix = c('', paste0('_T', trailing_sequences[x]))) %>%
+          compare_cols(paste0('_T', trailing_sequences[x])),
+        by = c('Date', 'Team'), suffix = c('', paste0('_T', trailing_sequences[x])))
+  }
+  
+  return(end_frame)
+}
+
+
+#Create the function to scale using z by row, removing date
+scale_z <- function(.data) {
+  idf <- .data
+  for(x in 1:nrow(idf)) {
+    #Compute average and standard deviation
+    avg <- mean(as.numeric(idf[x,-1]), na.rm = TRUE)
+    stdev <- sd(as.numeric(idf[x,-1]), na.rm = TRUE)
+    
+    #Backfill their stupid shit
+    for(i in 2:ncol(idf)) {
+      idf[x,i] <- (as.numeric(idf[x,i]) - avg)/stdev
+    }
+  }
+  #Return the data frame
+  return(idf)
+}
+
+#Create the function to do the fill forward and scaling of a variable
+scale_var <- function(data, variables) {
+  Reduce(merge, lapply(1:length(variables), function(x) {
+    print(variables[x])
+    dcast(data, Date ~ Team, fun.aggregate = mean, value.var = variables[x]) %>%
+      na.locf(na.rm = F) %>%
+      scale_z %>%
+      melt(id.vars = 'Date', variable.name = 'Team', value.name = variables[x])
+  }))
+}
+
+#Create the streak function
+streak_function <- function(data, variables) {
+  #Arrange by season and week
+  data <- 
+    data %>%
+    arrange(Date)
+  #Split by Team
+  data_spl <- split(data, data$Team)
+  
+  do.call("rbind", lapply(1:length(data_spl), function(x) {
+    cbind.data.frame(data_spl[[x]] %>%
+                       dplyr::select(Team, Date), 
+                     do.call("cbind.data.frame", 
+                             lapply(1:length(variables), function(i) {
+                               idf <- data.frame(GT = ifelse(data_spl[[x]][,variables[i]] > 
+                                                               data_spl[[x]][,paste0(variables[i], '_Alwd')],
+                                                             'more', 'less'))
+                               idf$streak <- sequence(rle(as.character(idf[,1]))$lengths)
+                               streak <- data.frame(shift(ifelse(idf$GT == 'more', 1*idf$streak, -1*idf$streak)))
+                               colnames(streak) <- paste0(variables[i], "_GT_OPP_STRK")
+                               streak
+                             })))
+  }))
+}
+
+#Function to compare to columns and return the difference
+pct_team_tot <- function(.data, suffix) {
+  idf <- .data
+  
+  #Grab columns that will remain
+  non_comparables <- 
+    colnames(idf) %>%
+    as.data.frame %>%
+    rowwise() %>%
+    mutate(red = gsub(suffix, "", .)) %>%
+    as.data.frame %>%
+    group_by(red) %>%
+    summarise(count = n()) %>%
+    filter(count == 1) %>%
+    .$red %>%
+    as.character
+  
+  cbind.data.frame(idf[,non_comparables], 
+                   do.call("cbind.data.frame", plyr::compact(lapply(1:ncol(idf), function(x) {
+                     if(paste0(colnames(idf)[x], suffix) %in% colnames(idf)) {
+                       pos <- match(paste0(colnames(idf)[x], suffix), colnames(idf))
+                       
+                       jdf <- 
+                         (idf[,x]/
+                            idf[,pos]) * 100
+                       
+                       jdf <- cbind.data.frame(jdf, idf[,x])
+                       colnames(jdf) <- c(paste0(colnames(idf)[x], '_PCT_TM'), colnames(idf)[x])
+                       return(jdf)
+                     }
+                   }))))
+  
+}
+
+#Create a function that will compute the minute-weighted cumulative sum of all stats
+cum_avg_stats <- function(.data) {
+  idf <- 
+    .data %>%
+    arrange(Date) %>%
+    mutate(Total_Minutes = cumsum(MIN))
+  
+  #Vars to weight average
+  vars <- c('AST_PCT', 'BLK_PCT', 'PTS', 'ASTD_PCT', 'fgDR_PCT', 'fgOR_PCT', 'MIN', 'PSA', 'STL_PCT', 'TOV_PCT', 
+            'Usage', 'REB', 'AST', 'FGM', 'FGA', 'FGM_3P', 'FGA_3P', 'FTM', 'FTA', 'PTS_PCT_TM', 'REB_PCT_TM',
+            'AST_PCT_TM', 'FGM_PCT_TM', 'FGA_PCT_TM', 'FGM_3P_PCT_TM', 'FGA_3P_PCT_TM', 'FTM_PCT_TM', 'FTA_PCT_TM')
+  
+  #Replace NA's with 0
+  for(i in 1:length(vars)) {
+    idf[is.na(idf[,vars[i]]),vars[i]] <- 0
+  }
+  
+  #Grab total minutes and games
+  tot_mins <- shift(cumsum(idf$MIN))
+  idf$scalar <- 1
+  tot_games <- shift(cumsum(idf$scalar))
+  
+  idf <-
+    cbind.data.frame(idf[,c('Date', 'Player', 'Team', 'STARTER')],
+                     do.call("cbind.data.frame", lapply(1:length(vars), function(i) {
+                       jdf <- shift(do.call("c", lapply(1:nrow(idf), function(x) {
+                         w1 <- idf$MIN[1:x]/idf$Total_Minutes[x]
+                         w2 <- idf[1:x, vars[i]]
+                         sum(w1 * w2)
+                       }))) %>%
+                         as.data.frame
+                       colnames(jdf) <- vars[i]
+                       return(jdf)
+                     })))
+  
+  #Add back total minutes and games
+  idf$TOT_MIN <- tot_mins
+  idf$TOT_GMS <- tot_games
+  
+  return(idf)
+  
+  
+}
+
+#Function to spread it into one row
+spread_starters <- function(.data) {
+  idf <- .data
+  vars <- c('BE', 'ST')
+  
+  Reduce(merge,
+         lapply(1:length(vars), function(x) {
+           idf %>%
+             filter(STARTER == vars[x]) %>%
+             dplyr::select(-STARTER) %>%
+             setNames(c(names(.)[1:2], paste(names(.)[-(1:2)], vars[x], sep = '_'))) %>%
+             as.data.frame 
+         }))
+}
+
+#Create function to determine the distance per day the team traveled in the last X games
+dist_per_day <- function(.data, N) {
+  .data %>%
+    group_by(Team) %>%
+    arrange(Date) %>%
+    mutate(days = as.numeric(difftime(Date, lag(Date, N), unit = "days")),
+           tot_dist = rollapplyr(Distance_Traveled, N, sum, fill = NA, na.rm = T),
+           dist_per_day = tot_dist/days) %>%
+    dplyr::select(Date, Team, dist_per_day) %>%
+    as.data.frame %>%
+    setNames(c(names(.)[1:2], paste0('DIST_TRL_', N, '_DYS')))
+}
+
+#Create a function to take many days and calculate distance per day
+dist_per_day_bulk <- function(.data, day_vector) {
+  idf <- .data
+  Reduce(merge, lapply(1:length(day_vector), function(x) { idf %>% dist_per_day(., day_vector[x]) }))
+}
+
+#Create the function that will fill last known value forward
+df_na.locf <- function(.data) {
+  idf <- .data %>%
+    arrange(Date)
+  do.call("cbind.data.frame", lapply(1:ncol(idf), function(x) {
+    ff <- na.locf(idf[,x], na.rm = FALSE) %>% as.data.frame
+    colnames(ff) <- colnames(idf)[x]
+    return(ff)
+  }))
+}
+
+
+#Create the mapping pre processing function
+pProc <- function(.data, drop_columns, transformation) {
+  idf <- .data %>%
+    as.data.frame %>%
+    dplyr::select(-one_of(drop_columns))
+  scl <- preProcess(idf, transformation)
+  predict(scl, .data)
+}
+
+
+#Function to elongate the home/away
+home_away_wide_format <- function(.data) {
+  idf <- .data
+  idf %>%
+    filter(Home_Away == 'Home') %>%
+    dplyr::select(-Home_Away) %>%
+    left_join(
+      idf %>%
+        filter(Home_Away == 'Away') %>%
+        dplyr::select(-Team, -Opponent, -Date, -Home_Away),
+      by = 'PK', suffix = c('_Home', '_Away')
+    )
+}
+
+
+#Function to elongate the home/away
+matrix_compare_wide_format <- function(.data) {
+  idf <- .data
+  idf <- 
+    idf %>%
+    filter(Home_Away == 'Home') %>%
+    dplyr::select(-Home_Away) %>%
+    left_join(
+      idf %>%
+        filter(Home_Away == 'Away') %>%
+        dplyr::select(-Team, -Opponent, -Date, -Home_Away),
+      by = c('PK', 'PROC_TEAM'), suffix = c('_Home', '_Away')
+    ) %>%
+    na.omit()
+  
+  #Non comparable columns
+  non_comparables <- 
+    colnames(idf) %>%
+    as.data.frame %>%
+    rowwise() %>%
+    mutate(red = gsub("_Home", "", .),
+           red = gsub("_Away", "", red)) %>%
+    as.data.frame %>%
+    group_by(red) %>%
+    summarise(count = n()) %>%
+    filter(count == 1) %>%
+    .$red %>%
+    as.character
+  
+  cbind.data.frame(idf[,non_comparables], 
+                   do.call("cbind.data.frame", 
+                           plyr::compact(
+                             lapply(1:ncol(idf), function(x) {
+                               if(colnames(idf)[x] %in% non_comparables) {} else {
+                                 
+                                 pos <- match(gsub("_Home", "", colnames(idf)[x]), gsub("_Away", "", colnames(idf)))
+                                 
+                                 if(is.na(pos)) {} else {
+                                   
+                                   jdf <- 
+                                     (idf[,x] - idf[,pos])
+                                   
+                                   jdf <- jdf %>% as.data.frame
+                                   colnames(jdf) <- colnames(idf)[x]
+                                   return(jdf)
+                                 }
+                               }
+                             })
+                           )
+                   )
+  ) %>%
+    setNames(gsub("_Home", "", gsub("_1_", "_", names(.)))) %>%
+    dplyr::select(-PROC_TEAM) %>%
+    group_by(Date, Team, Opponent, PK) %>%
+    summarise_all(list(AVG_DIF = mean)) %>%
+    as.data.frame
+}
+
