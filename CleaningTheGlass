@@ -1,0 +1,357 @@
+#First call the package import/load script
+source('H:/NBA/Scripts/Package_Import.R')
+
+#Function to start an automated browser port
+start_selenium <- function() {
+  assign("rD", { tryCatch({ rsDriver(port = as.integer(4000+sample(1:3000,1)), 
+                                     browser = "chrome",
+                                     version = "3.141.5",
+                                     chromever = "78.0.3904.105") },
+                          error = function(e) { rsDriver(port = as.integer(4000+sample(1:3000,1)), 
+                                                         browser = "chrome",
+                                                         version = "3.141.5",
+                                                         chromever = "76.0.3809.12") }) },
+         envir = .GlobalEnv)
+  
+  assign("remDr", rD$client, envir = .GlobalEnv)
+}
+
+#Function to log in to cleaning the glass
+login_ctg <- function() {
+  #Start selenium
+  start_selenium()
+  
+  #Navigate to the home webpage first
+  remDr$navigate('http://cleaningtheglass.com/')
+    Sys.sleep(3)
+
+  #Navigate to login page
+  remDr$navigate('http://cleaningtheglass.memberful.com/auth/sign_in')
+  Sys.sleep(3)
+  
+  #Send username
+  username <- remDr$findElement(using = "id", value = "login")
+  username$clearElement()
+  username$sendKeysToElement(list("ryanfwhite93@gmail.com"))
+  Sys.sleep(3)
+  
+  #Send password and Enter
+  passwd <- remDr$findElement(using = "id", value = "password")
+  passwd$clearElement()
+  passwd$sendKeysToElement(list("9ACbhs68ZJ9*", "\uE007"))  
+  Sys.sleep(3)
+  
+  #Go back to home page
+  remDr$navigate('http://cleaningtheglass.com/')
+  Sys.sleep(3)
+  
+  #Now click on login button
+  remDr$findElement(value = '//*[@id="header_menu"]/li[6]/a')$clickElement()
+  Sys.sleep(15)
+}
+
+#Function to grab all of the box score links on a given day
+box_score_urls <- function(date) {
+  remDr$navigate(paste0('http://cleaningtheglass.com/stats/games?date=', date))
+  page <- remDr$getPageSource()
+  page[[1]] %>%
+    read_html %>%
+    html_nodes("a") %>%
+    html_attr("href") %>%
+    as.data.frame %>%
+    filter(grepl('game_detail', .)) %>%
+    .$. %>%
+    unique %>%
+    as.character
+}
+
+#Function to extract the allowed points
+alwd <- function(...) {
+  sum(...) - (...)
+}
+
+#Create a function that will remove the 'rankings' from the columns
+#And add the team name
+refactor_columns <- function(data, f) {
+  #Give first column the team header
+  colnames(data)[1] <- 'Team'
+  
+  #Grab the unique column names
+  uniq <- unique(colnames(data))
+  
+  #We don't want the rankings, they are the first positioned in duplicated names
+  data <-
+    data[,do.call("c", lapply(1:length(uniq), function(x) {
+      get(f)((which(colnames(data) == uniq[x])))
+    }))]
+  
+  #Return data
+  return(data)
+}
+
+
+#Function to identify and fix the columns with '/' separators
+made_att_sep <- function(.data) {
+  df <- .data
+  ids <- which(do.call("c", lapply(1:ncol(df), function(x) { any(grepl("[/]", df[,x])) })))
+  
+  df <- cbind.data.frame(Team = df[,-ids], 
+                         
+                         #Separate them and cbind
+                         do.call("cbind.data.frame", lapply(1:length(ids), function(x) {
+                           df %>%
+                             dplyr::select(one_of(colnames(df)[ids[x]])) %>%
+                             setNames("new") %>%
+                             separate(new, into = c("made", "att")) %>%
+                             setNames(paste(colnames(df)[ids[x]], names(.), sep = '_'))
+                         })))
+  
+  #Fix the column names
+  for(i in 1:ncol(df)) {
+    if(grepl("_made", colnames(df)[i])) {
+      colnames(df)[i] <- paste0('FGM', gsub("_made", "", colnames(df)[i]))
+    } else {
+      if(grepl("_att", colnames(df)[i])) {
+        colnames(df)[i] <- paste0('FGA', gsub("_att", "", colnames(df)[i]))
+      }
+    }
+  }
+  
+  #Return the data
+  return(df)
+}
+
+#Structure the shooting accuracy/frequency tables
+acc_freq_struct <- function(data, prefix, f) {
+  #Refactor the columns
+  data <- refactor_columns(data, f)
+  
+  #Rename the columns
+  name_convert <- data.frame(old = c('Rim', 'ShortMid', 'LongMid', 'AllMid', 'CornerThree', 'NonCorner', 'AllThree'),
+                             new = c('RIM', 'SHRT_MID', 'LNG_MID', 'ALL_MID', 'CRN3', 'NONCRN3', 'ALL3'),
+                             stringsAsFactors = FALSE)
+  
+  for(i in 1:ncol(data)) {
+    colnames(data)[i] <- if(colnames(data)[i] %in% name_convert$old) { 
+      paste0(prefix, '_', name_convert$new[match(colnames(data)[i], name_convert$old)]) } else { 
+        colnames(data)[i] }
+  }
+  
+  
+  #Return the data
+  return(data)
+}
+
+#Create a function to structure halfcourt and putbacks
+hc_pbs <- function(data) {
+  #Fix the headers
+  colnames(data) <- paste(colnames(data), data[1,], sep = '_')
+  data <- refactor_columns(data[-1,], "max")
+  colnames(data) <- gsub("%", "", gsub("Putbacks", "PBCKS", gsub("Halfcourt", "HLFCRT", 
+                                                                 gsub("% of ", "PCT_", gsub("[/]", "_Per_", colnames(data))))))
+  
+  #Remove NA columns
+  data <- data[,!(apply(data, 2, function(x) { sum(is.na(x)) })/nrow(data) == 1)]
+  
+  return(data)
+}
+
+
+#Create a function to structure halfcourt and putbacks
+trans_stats <- function(data) {
+  #Fix the headers
+  colnames(data) <- paste(colnames(data), data[1,], sep = '_')
+  data <- refactor_columns(data[-1,], "max")
+  colnames(data) <- toupper(gsub("%", "", gsub("All Transition", "ALL_TRANS", 
+                                               gsub("Off Steals", "OFF_STEALS", 
+                                                    gsub("Off Live Rebounds", "OFF_LVE_REB",
+                                                         gsub("[+]", "_POS", gsub("[/]", "_Per_", colnames(data))))))))
+  
+  #Remove NA columns
+  data <- data[,!(apply(data, 2, function(x) { sum(is.na(x)) })/nrow(data) == 1)]
+  
+  #Make team propah mofucka
+  colnames(data)[1] <- 'Team'
+  
+  return(data)
+}
+
+
+#Function to structure the player data
+player_struct <- function(data) {
+  tryCatch({
+  #Step 1: Get rid of the percentile bullshit columns
+  colnames(data)[2] <- 'STARTER'
+  uniq <- unique(colnames(data))
+  uniq <- uniq[!is.na(uniq)]
+  data <-
+    data[,do.call("c", lapply(1:length(uniq), function(x) {
+      max((which(colnames(data) == uniq[x])))
+    }))]
+  
+  #Step 2 find the team names (then eliminate from rows)
+  dups <- which(do.call("c", lapply(1:nrow(data), function(x) {
+    length(unique(paste(data[x,])))
+  })) == 1)
+  
+  data$Team <- c(rep(data[dups[1], 1], times = (dups[2] - dups[1])), 
+                 rep(data[dups[2], 1], times = (nrow(data) - dups[2] + 1)))
+  
+  data <- 
+    data %>%
+    filter(Player != Team)
+  
+  #Step 3 separate the FGM/A, 3PM/A, FTM/A
+  data <-
+    data %>%
+    separate(`3PM/A`, sep = '[/]', into = c('FGM_3P', 'FGA_3P'), remove = TRUE, convert = TRUE) %>%
+    separate(`FGM/A`, sep = '[/]', into = c('FGM', 'FGA'), remove = TRUE, convert = TRUE) %>%
+    separate(`FTM/A`, sep = '[/]', into = c('FTM', 'FTA'), remove = TRUE, convert = TRUE)
+  
+  
+  #Step 4: Convert into numerically valid
+  to_convert <- colnames(data)[!(colnames(data) %in% c('Player', 'STARTER', 'Team'))]
+  
+  for(i in 1:length(to_convert)) {
+    data[,to_convert[i]] <- as.numeric(gsub("%", "", data[,to_convert[i]]))
+  }
+  
+  colnames(data) <- gsub("%", "_PCT", colnames(data))
+  
+  data <-
+    data %>%
+    mutate(STARTER = ifelse(STARTER == "*", "ST", "BE"))
+  
+  return(data)
+  }, error = function(e) {} )
+}
+
+
+#Create the function that will structure the tables
+structure_tables <- function(data) {
+  #Four factors
+  #Refactor columns
+  four_factors <- refactor_columns(data[[1]], "max")
+  colnames(four_factors) <- gsub(" ", "", gsub("%", "", gsub("[/]", "_Per_", colnames(four_factors))))
+  four_factors$Opponent <- rev(as.character(four_factors$Team))
+  four_factors$Home_Away <- c("Away", "Home")
+  
+  #Shooting accuracy/Frequency
+  acc <- acc_freq_struct(data[[2]], 'ACC', "max")
+  freq <- acc_freq_struct(data[[3]], 'FREQ', "max")
+  
+  #Halfcourt/putbacks
+  hlfcrt <- hc_pbs(data[[5]])
+  
+  #Transition stats
+  tstats <- trans_stats(data[[6]])
+  
+  #Merge all results into a data frame
+  idf <- 
+    Reduce(merge, list(
+      four_factors,
+      acc, freq, hlfcrt, tstats
+    ))
+  
+  #Replace %'s with numerics
+  for(i in 1:ncol(idf)) {
+    idf[,i] <- if(colnames(idf)[i] %in% c('Team', 'Home_Away', 'Opponent')) {
+      idf[,i] } else { as.numeric(paste(gsub("%", "", idf[,i]))) }
+  }
+  
+  # #Replace NA's with 0s
+  # for(i in 1:ncol(idf)) {
+  #   idf[is.na(idf[,i]),i] <- 0
+  # }
+  
+  #Add in the allowed stats
+  idf <- idf %>%
+    mutate_at(vars(-Team, -Opponent, -Home_Away), 
+              list(Alwd = alwd))
+  
+  
+  #Return the data frame
+  return(idf)
+}
+
+#Function to get all the box score {[team] -- [player //TODO]} data for a given url
+get_data <- function(date) {
+  boxes <- box_score_urls(date)
+  if(length(boxes) > 0) {
+    bigList <-
+      lapply(1:length(boxes), function(i) {
+        remDr$navigate(paste0('http://cleaningtheglass.com', boxes[i]))
+        page <- remDr$getPageSource()
+        
+        #Scrape all tables
+        all_tables <-
+          page[[1]] %>%
+          read_html %>%
+          html_table(fill = TRUE)
+        
+        list(
+          TEAM_STATS = structure_tables(all_tables) %>% mutate(Date = date),
+          PLAYER_STATS = tryCatch({ player_struct(all_tables[[7]]) %>% mutate(Date = date) }, error = function(e) {} )
+        )
+        
+      })
+    list(TEAM_STATS = bigList %>% map(1) %>% invoke(rbind, .) %>% mutate(id = paste(Date, Team, sep = '_')),
+         PLAYER_STATS = tryCatch({ bigList %>% map(2) %>% invoke(rbind, .) %>% mutate(id = paste(Date, Team, sep = '_')) }, error = function(e) {} )
+    )
+  }
+}
+
+#Create the function to insert the data
+upload_data <- function(date) {
+  data <- get_data(as.Date(date))
+  
+  #Establish the names of the tables
+  table_names <- c("CTG_TEAM", "CTG_PLAYER")
+  
+  #Establish connection to mongodb
+  username <- 'thatsmrlongcut'
+  password <- 'football17'
+  
+  for(i in 1:length(table_names)) {
+    tryCatch({
+    con <-
+      mongo(
+        collection = "NFL",
+        db = table_names[i],
+        url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+      )
+    
+    #Find all of the ids in the table
+    ids <- con$distinct('id', query = '{}')
+    
+    #Filter out data found in the database
+    import_data <- 
+      data[[i]] %>%
+      filter(id %in% ids == FALSE)
+    
+    #Import the data that is remaining
+    if(is.null(import_data)) {} else { 
+      con$insert(import_data)
+      rm(con)
+      }
+    }, error = function(e) {} )
+  }
+}
+
+#Function to scrape multi-dates
+multi_day_scrape <- function(dates) {
+  login_ctg()
+  for(i in 1:length(dates)) {
+    upload_data(dates[i])
+  }
+}
+
+####################################################################
+
+#Assuming this is ran everyday -- default values of dates will be yesterday
+#Sample dates
+dates <- seq(from = as.Date(now(tz = "EST")-(24*60*60)),
+             to = as.Date(now(tz = "EST")-(24*60*60)),
+             by = "day")
+
+multi_day_scrape(dates)
