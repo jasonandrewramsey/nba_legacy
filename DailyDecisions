@@ -1,0 +1,517 @@
+#Extract the historical lines
+lines <-
+  mongo(
+    collection = "NFL",
+    db = 'BETTING_TABLE',
+    url = paste0("mongodb+srv://thatsmrlongcut:football17@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority")
+  )$find() %>%
+  mutate(Date = as.Date(Date))
+
+#List the variables
+y_vars <- c('Spread', 'Over_Under', 'Total_Points', 'Points', 'Points_Alwd', 'Over_Under_Coverage', 'Over_Under_Differential',
+            'Point_Differential', 'Spread_Differential', 'Spread_Coverage', 'Win_Loss')
+
+#Extract the historical predictions
+hist_tbl <-
+  mongo(
+    collection = "NFL",
+    db = "NBA_HISTORICAL_PREDICTION_RESULTS",
+    url = paste0("mongodb+srv://thatsmrlongcut:football17@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority")
+  )$find() %>%
+  mutate(Home_Team = Team, Away_Team = Opponent, Date = as.Date(Date)) %>%
+  dplyr::select(-one_of(c(y_vars, 'id', 'Team', 'Opponent')))
+
+#Join the lines and the historical table
+df <- 
+  lines %>%
+  inner_join(hist_tbl, by = c('Date', 'Home_Team', 'Away_Team')) %>%
+  mutate(Point_Differential = Home_Points - Away_Points,
+         Over_Under_Differential = Total_Points - Over_Under,
+         Spread_Differential = Point_Differential + Spread,
+         Spread_Coverage = ifelse(Spread_Differential == 0, 'push', ifelse(Spread_Differential > 0, 'covered', 'loss')),
+         Over_Under_Coverage = ifelse(Over_Under_Differential == 0, 'push', ifelse(Over_Under_Differential > 0, 'over', 'under')),
+         Win_Loss = ifelse(Point_Differential > 0, 'win', 'loss')) %>%
+  arrange(Date) %>%
+  mutate(game_id = row_number())
+
+#Grab the current prediction table
+cur_pred_table <- 
+  mongo(
+    collection = "NFL",
+    db = "NBA_CURRENT_PREDICTION_TABLE",
+    url = paste0("mongodb+srv://thatsmrlongcut:football17@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority")
+  )$find()
+
+### Apply the hard voting to each data frame
+df_bin <- list(df, cur_pred_table)
+
+#Spread Coverage
+sc_vars <- paste0("Spread_Coverage_", seq(from = 1, to = 5))
+#Spread Differential
+sd_vars <- paste0('Spread_Differential_', 1:5)
+#Over Under Coverage
+ouc_vars <- paste0('Over_Under_Coverage_', 1:5)
+#Over Under Differential
+oud_vars <- paste0('Over_Under_Differential_', 1:5)
+
+df_bin <- 
+  lapply(1:length(df_bin), function(x) {
+    df <- df_bin[[x]]
+    #Sc
+    df[,sc_vars] <- ifelse(df[,sc_vars] > 0.5, "covered", "loss")
+    
+    #Sd
+    df[,ouc_vars] <- ifelse(df[,ouc_vars] > 0.5, "over", "under")
+    
+    #Ouc
+    df[,sd_vars] <- ifelse(df[,sd_vars] > 0, "covered", "loss")
+    
+    #Oud
+    df[,oud_vars] <- ifelse(df[,oud_vars] > 0, "over", "under")
+    
+    return(df)
+})
+
+names(df_bin) <- c('HISTORICAL', 'CURRENT')
+
+################################
+############################
+########################
+# ~ Spread Coverage
+########################
+############################
+################################
+
+########
+#Prepare Objects
+########
+
+#Data frame w/o pushes
+sc_df <- 
+  df_bin$HISTORICAL %>%
+  filter(Spread_Coverage != 'push',
+         Set != 'Layer 2')
+
+#Define the set of variables
+sc_vars <- c(sc_vars)
+
+#Makes an object that contains all combinations of the 5 models (31)
+all_combos <-
+  do.call("c", 
+          lapply(1:length(sc_vars), function(x) {
+            combn_mat <- combn(sc_vars, x)
+            lapply(1:ncol(combn_mat), function(i) {
+              combn_mat[,i]
+            })
+          }))
+
+#Function to rename columns
+rn_cols <- function(.data) {
+  idf <- .data
+  nm <- idf$set[1] %>% as.character
+  idf <- idf %>% dplyr::select(-set)
+  for(i in 1:ncol(idf)) {
+    if(colnames(idf)[i] %in% c('decision', 'model_name')) {} else {colnames(idf)[i] <- paste(nm, colnames(idf)[i], sep = '_')}
+  }
+  return(idf)
+}
+
+
+########
+#Historical Accuracy Compilation
+########
+
+### Historical Accuracy of each Hard Voting Model Pair
+
+#Run the historical performance
+sc_hist_perf <-
+lapply(1:length(all_combos), function(x) {
+ sc_df %>%
+    dplyr::select(one_of(c('Date', 'game_id', 'Spread_Coverage', all_combos[[x]]))) %>%
+    melt(id.vars = c('Date', 'game_id', 'Spread_Coverage'), variable.name = "model") %>%
+    group_by(Date, game_id, Spread_Coverage) %>%
+    summarise(cov_cnt = sum(value == 'covered'),
+              loss_cnt = sum(value == 'loss')) %>%
+    as.data.frame %>%
+    mutate(decision = ifelse(cov_cnt == length(all_combos[[x]]), 'covered', ifelse(loss_cnt == length(all_combos[[x]]), 'loss', 'no-decision'))) %>%
+    filter(decision != 'no-decision') %>%
+    mutate(set = df$Set[match(Date, df$Date)]) %>%
+    group_by(set, decision) %>%
+    summarise(bets = n(),
+              won = sum(decision == Spread_Coverage)) %>%
+    as.data.frame %>%
+    mutate(accuracy = won/bets,
+           model = paste(all_combos[[x]], collapse = '+'),
+           model_name = paste(model, decision, sep = ':')) %>%
+    dplyr::select(set, decision, bets, won, accuracy, model_name) %>%
+    split(., .$set) %>%
+    map(~rn_cols(.)) %>%
+    reduce(left_join, by = c('decision', 'model_name'))
+}) %>%
+  invoke(rbind, .) %>%
+  as.data.frame %>%
+  rowwise() %>%
+  mutate(model_name = gsub("Spread_Differential_", "sd_", gsub("Spread_Coverage_", "sc_", model_name))) %>%
+  as.data.frame
+
+########
+#Current Hard Voting Compilation
+########
+
+### Hard Voting Model Pairing for today's showdowns
+
+#Run the current prediction table
+sc_cur_slate <- 
+  lapply(1:length(all_combos), function(x) {
+  df_bin$CURRENT %>%
+  mutate(game = paste(Opponent, Team, sep = '@')) %>%
+  dplyr::select(one_of(c('game', all_combos[[x]]))) %>%
+  melt(id.vars = c('game'), variable.name = "model") %>%
+  group_by(game) %>%
+  summarise(cov_cnt = sum(value == 'covered'),
+            loss_cnt = sum(value == 'loss')) %>%
+  as.data.frame %>%
+  mutate(decision = ifelse(cov_cnt == length(all_combos[[x]]), 'covered', ifelse(loss_cnt == length(all_combos[[x]]), 'loss', 'no-decision'))) %>%
+  filter(decision != 'no-decision') %>%
+  mutate(model = paste(all_combos[[x]], collapse = '+'),
+         model_name = paste(model, decision, sep = ':')) %>%
+  dplyr::select(game, model_name)
+}) %>%
+  invoke(rbind, .) %>%
+  as.data.frame %>%
+  rowwise() %>%
+  mutate(model_name = gsub("Spread_Differential_", "sd_", gsub("Spread_Coverage_", "sc_", model_name))) %>%
+  as.data.frame %>%
+  group_by(model_name) %>%
+  summarise(games = paste(game, collapse = ', ')) %>%
+  as.data.frame
+
+########
+#Today's SC bets
+########
+
+### Today's Spread Coverage Predictions
+
+#Merge the two to get today's results
+sc_hist_perf %>% 
+  arrange(desc(Holdout_accuracy)) %>% 
+  filter(Production_accuracy > 0.60, Holdout_accuracy > 0.60) %>%
+  left_join(sc_cur_slate, by = 'model_name') %>%
+  na.omit() %>%
+  split(., .$games) %>%
+  map(~head(.))
+  
+##Or look at it like this
+sc_hist_perf %>% 
+  arrange(desc(Holdout_accuracy)) %>% 
+  filter(Production_accuracy > 0.57, Holdout_accuracy > 0.57) %>%
+  left_join(sc_cur_slate, by = 'model_name') %>%
+  na.omit() %>%
+  group_by(games) %>%
+  summarise(
+    unique_decision_cnt = length(unique(decision)),
+    decision = names(sort(table(decision), decreasing = T))[1],
+    model_cnt = n()
+  )
+
+########
+#Historical Results
+########
+  
+### Historical Results -- by game
+  
+#Grouped by game (1 decision per game)
+sc_hist_game <- 
+  lapply(1:length(all_combos), function(x) {
+    sc_df %>%
+      dplyr::select(one_of(c('Date', 'game_id', 'Spread_Coverage', all_combos[[x]]))) %>%
+      melt(id.vars = c('Date', 'game_id', 'Spread_Coverage'), variable.name = "model") %>%
+      group_by(Date, game_id, Spread_Coverage) %>%
+      summarise(cov_cnt = sum(value == 'covered'),
+                loss_cnt = sum(value == 'loss')) %>%
+      as.data.frame %>%
+      mutate(decision = ifelse(cov_cnt == length(all_combos[[x]]), 'covered', ifelse(loss_cnt == length(all_combos[[x]]), 'loss', 'no-decision'))) %>%
+      filter(decision != 'no-decision') %>%
+      mutate(model = paste(all_combos[[x]], collapse = '+'),
+             model_name = paste(model, decision, sep = ':')) %>%
+      dplyr::select(Date, game_id, Spread_Coverage, decision, model_name)
+}) %>% 
+  invoke(rbind, .) %>%
+  rowwise() %>%
+  mutate(model_name = gsub("Spread_Differential_", "sd_", gsub("Spread_Coverage_", "sc_", model_name))) %>%
+  as.data.frame
+
+
+#Determine what models are 'in use' to backtest against
+in_use_sc_models <-
+sc_hist_perf %>%
+  arrange(desc(Holdout_accuracy)) %>%
+  filter(Production_accuracy > 0.57, Holdout_accuracy > 0.57) %>%
+  .$model_name %>%
+  as.character()
+
+# in_use_sc_models <- read.csv('H:/NBA/Scripts/in_scope_sc_models.csv', stringsAsFactors = F)$variable
+
+#Filter for models 'in use' in the historical
+sc_hist_game %>%
+  filter(model_name %in% in_use_sc_models) %>%
+  group_by(Date, game_id, Spread_Coverage) %>%
+  summarise(unique_decision_cnt = length(unique(decision)),
+            most_common_decision =  names(sort(table(decision), decreasing = T))[1]) %>%
+  as.data.frame %>%
+  filter(unique_decision_cnt == 1) %>%
+  mutate(set = df$Set[match(Date, df$Date)]) %>%
+  group_by(set) %>%
+  summarise(
+    days = length(unique(Date)),
+    games = n(),
+    won = sum(Spread_Coverage == most_common_decision)
+  ) %>%
+  as.data.frame %>%
+  mutate(lost = games - won,
+         accuracy = won/games,
+         net_unit_gain = (1.9 * won) - games,
+         net_unit_per_day = net_unit_gain/days)
+
+################################
+############################
+########################
+# ~ Over Under Coverage
+########################
+############################
+################################
+
+########
+#Prepare Objects
+########
+
+#Data frame w/o pushes
+ouc_df <- 
+  df_bin$HISTORICAL %>%
+  filter(Over_Under_Coverage != 'push',
+         Set != 'Layer 2')
+
+#Define the set of variables
+ouc_vars <- c(ouc_vars, oud_vars)
+
+#Makes an object that contains all combinations of the 5 models (31)
+all_combos <-
+  do.call("c", 
+          lapply(1:length(ouc_vars), function(x) {
+            combn_mat <- combn(ouc_vars, x)
+            lapply(1:ncol(combn_mat), function(i) {
+              combn_mat[,i]
+            })
+          }))
+
+#Function to rename columns
+rn_cols <- function(.data) {
+  idf <- .data
+  nm <- idf$set[1] %>% as.character
+  idf <- idf %>% dplyr::select(-set)
+  for(i in 1:ncol(idf)) {
+    if(colnames(idf)[i] %in% c('decision', 'model_name')) {} else {colnames(idf)[i] <- paste(nm, colnames(idf)[i], sep = '_')}
+  }
+  return(idf)
+}
+
+########
+#Historical Accuracy Compilation
+########
+
+### Historical Accuracy of each Hard Voting Model Pair
+#Run the historical performance
+ouc_hist_perf <-
+  lapply(1:length(all_combos), function(x) {
+    ouc_df %>%
+      dplyr::select(one_of(c('Date', 'game_id', 'Over_Under_Coverage', all_combos[[x]]))) %>%
+      melt(id.vars = c('Date', 'game_id', 'Over_Under_Coverage'), variable.name = "model") %>%
+      group_by(Date, game_id, Over_Under_Coverage) %>%
+      summarise(cov_cnt = sum(value == 'over'),
+                loss_cnt = sum(value == 'under')) %>%
+      as.data.frame %>%
+      mutate(decision = ifelse(cov_cnt == length(all_combos[[x]]), 'over', ifelse(loss_cnt == length(all_combos[[x]]), 'under', 'no-decision'))) %>%
+      filter(decision != 'no-decision') %>%
+      mutate(set = df$Set[match(Date, df$Date)]) %>%
+      group_by(set, decision) %>%
+      summarise(bets = n(),
+                won = sum(decision == Over_Under_Coverage)) %>%
+      as.data.frame %>%
+      mutate(accuracy = won/bets,
+             model = paste(all_combos[[x]], collapse = '+'),
+             model_name = paste(model, decision, sep = ':')) %>%
+      dplyr::select(set, decision, bets, won, accuracy, model_name) %>%
+      split(., .$set) %>%
+      map(~rn_cols(.)) %>%
+      reduce(left_join, by = c('decision', 'model_name'))
+  }) %>%
+  invoke(rbind, .) %>%
+  as.data.frame %>%
+  rowwise() %>%
+  mutate(model_name = gsub("Over_Under_Differential_", "oud_", gsub("Over_Under_Coverage_", "ouc_", model_name))) %>%
+  as.data.frame
+
+########
+#Current Hard Voting Compilation
+########
+
+### Hard Voting Model Pairing for today's showdowns
+
+#Run the current prediction table
+ouc_cur_slate <- 
+  lapply(1:length(all_combos), function(x) {
+    df_bin$CURRENT %>%
+      mutate(game = paste(Opponent, Team, sep = '@')) %>%
+      dplyr::select(one_of(c('game', all_combos[[x]]))) %>%
+      melt(id.vars = c('game'), variable.name = "model") %>%
+      group_by(game) %>%
+      summarise(cov_cnt = sum(value == 'over'),
+                loss_cnt = sum(value == 'under')) %>%
+      as.data.frame %>%
+      mutate(decision = ifelse(cov_cnt == length(all_combos[[x]]), 'over', ifelse(loss_cnt == length(all_combos[[x]]), 'under', 'no-decision'))) %>%
+      filter(decision != 'no-decision') %>%
+      mutate(model = paste(all_combos[[x]], collapse = '+'),
+             model_name = paste(model, decision, sep = ':')) %>%
+      dplyr::select(game, model_name)
+  }) %>%
+  invoke(rbind, .) %>%
+  as.data.frame %>%
+  rowwise() %>%
+  mutate(model_name = gsub("Over_Under_Differential_", "oud_", gsub("Over_Under_Coverage_", "ouc_", model_name))) %>%
+  as.data.frame %>%
+  group_by(model_name) %>%
+  summarise(games = paste(game, collapse = ', ')) %>%
+  as.data.frame
+
+########
+#Today's OUC bets
+########
+
+### Today's Over Under Coverage Predictions
+
+#Merge the two to get today's results
+ouc_hist_perf %>% 
+  arrange(desc(Holdout_accuracy)) %>% 
+  filter(Production_accuracy > 0.57, Holdout_accuracy > 0.57) %>%
+  left_join(ouc_cur_slate, by = 'model_name') %>%
+  na.omit() %>%
+  split(., .$games) %>%
+  map(~head(.))
+
+##Or look at it like this
+ouc_hist_perf %>% 
+  arrange(desc(Holdout_accuracy)) %>% 
+  filter(Production_accuracy > 0.55, Holdout_accuracy > 0.55) %>%
+  left_join(ouc_cur_slate, by = 'model_name') %>%
+  na.omit() %>%
+  group_by(games) %>%
+  summarise(
+    unique_decision_cnt = length(unique(decision)),
+    decision = names(sort(table(decision), decreasing = T))[1],
+    model_cnt = n()
+  )
+
+
+########
+#Historical Results
+########
+
+### Historical Results -- by game
+
+#Grouped by game (1 decision per game)
+ouc_hist_game <- 
+  lapply(1:length(all_combos), function(x) {
+    ouc_df %>%
+      dplyr::select(one_of(c('Date', 'game_id', 'Over_Under_Coverage', all_combos[[x]]))) %>%
+      melt(id.vars = c('Date', 'game_id', 'Over_Under_Coverage'), variable.name = "model") %>%
+      group_by(Date, game_id, Over_Under_Coverage) %>%
+      summarise(cov_cnt = sum(value == 'over'),
+                loss_cnt = sum(value == 'under')) %>%
+      as.data.frame %>%
+      mutate(decision = ifelse(cov_cnt == length(all_combos[[x]]), 'over', ifelse(loss_cnt == length(all_combos[[x]]), 'under', 'no-decision'))) %>%
+      filter(decision != 'no-decision') %>%
+      mutate(model = paste(all_combos[[x]], collapse = '+'),
+             model_name = paste(model, decision, sep = ':')) %>%
+      dplyr::select(Date, game_id, Over_Under_Coverage, decision, model_name)
+  }) %>% 
+  invoke(rbind, .) %>%
+  rowwise() %>%
+  mutate(model_name = gsub("Over_Under_Differential_", "oud_", gsub("Over_Under_Coverage_", "ouc_", model_name))) %>%
+  as.data.frame
+
+#Determine what models are 'in use' to backtest against
+# in_use_ouc_models <-
+#   ouc_hist_perf %>% 
+#   arrange(desc(Holdout_accuracy)) %>% 
+#   filter(Production_accuracy > 0.57, Holdout_accuracy > 0.57) %>%
+#   .$model_name %>%
+#   as.character
+
+in_use_ouc_models <- read.csv('H:/NBA/Scripts/in_scope_ouc_models.csv', stringsAsFactors = F)$variable
+
+################################
+############################
+########################
+# ~ Output - Decision time fag
+########################
+############################
+################################
+
+#Function to split the stupid ass strings i made earlier and this is faster
+fuck_str_split <- function(.data) {
+  suppressWarnings({
+  idf <- .data
+  lapply(1:nrow(idf), function(x) {
+    cbind.data.frame(
+      data.frame(game = strsplit(paste(idf$games[x]), ", ")[[1]]),
+      idf[x,])
+  }) %>%
+    invoke(rbind, .)
+  })
+}
+
+##Or look at it like this
+list(
+  sc_hist_perf %>% 
+  arrange(desc(Holdout_accuracy)) %>% 
+  filter(Production_accuracy > 0.57, Holdout_accuracy > 0.57) %>%
+  left_join(sc_cur_slate, by = 'model_name') %>%
+  na.omit() %>%
+  group_by(games) %>%
+  summarise(
+    unique_decision_cnt = length(unique(decision)),
+    decision = names(sort(table(decision), decreasing = T))[1],
+    model_cnt = n()
+  ) %>%
+  fuck_str_split(.) %>%
+  as.data.frame %>%
+  group_by(game) %>%
+  summarise(decision = names(sort(table(decision), decreasing = T))[1],
+            problem = ifelse(max(unique_decision_cnt) > 1, 'yes', 'no'),
+            in_scope_model_agreement_cnt = sum(model_cnt)) %>%
+  as.data.frame %>%
+  rowwise() %>%
+  mutate(bet_on = ifelse(decision == "loss", strsplit(paste(game), "@")[[1]][1], strsplit(paste(game), "@")[[1]][2])),
+  
+##Or look at it like this
+ouc_hist_perf %>% 
+  arrange(desc(Holdout_accuracy)) %>% 
+  filter(Production_accuracy > 0.57, Holdout_accuracy > 0.57, Production_bets > 9) %>%
+  left_join(ouc_cur_slate, by = 'model_name') %>%
+  na.omit() %>%
+  group_by(games) %>%
+  summarise(
+    unique_decision_cnt = length(unique(decision)),
+    decision = names(sort(table(decision), decreasing = T))[1],
+    model_cnt = n()
+  ) %>%
+  as.data.frame %>%
+  fuck_str_split(.) %>%
+  as.data.frame %>%
+  group_by(game) %>%
+  summarise(decision = names(sort(table(decision), decreasing = T))[1],
+            problem = ifelse(max(unique_decision_cnt) > 1, 'yes', 'no'),
+            in_scope_model_agreement_cnt = sum(model_cnt)) %>%
+  as.data.frame
+) %>%
+  invoke(plyr::rbind.fill, .)
